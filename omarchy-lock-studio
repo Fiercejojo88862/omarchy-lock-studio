@@ -1847,7 +1847,7 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--sync-repo":
         r = sync_repo()
         if r.get("ok"):
-            print(("Synced: " + r["commit"]) if r.get("committed") else "Dotfiles repo already up to date.")
+            print(("Synced: " + r["commit"]) if r.get("committed") else "Project repo already up to date.")
         else:
             print("Sync failed: " + r.get("error", "unknown"))
         return

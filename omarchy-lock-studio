@@ -1,0 +1,1898 @@
+#!/usr/bin/env python3
+"""
+omarchy-lock-studio — a safe, Omarchy-way lock screen customizer.
+
+* Clones the omarchy.lock plugin (already done -> josephs.lock) and edits the
+  user copy in ~/.config/omarchy/plugins/<user>.lock/ (never /usr/share/omarchy).
+* Generates LockView.qml from a template, preserving the password field + PAM
+  auth signals (so you can always unlock).
+* Serves a local web UI (opened in Firefox) with a real-time preview that
+  uses your active Omarchy theme colors.
+* Backs up LockView.qml before every change; supports restore + restore-stock.
+
+Controls:
+  omarchy-lock-studio            start server + open browser
+  omarchy-lock-studio --no-open  start server without opening a browser
+  omarchy-lock-studio --restore-stock   restore the untouched cloned lock
+  omarchy-lock-studio --sync-repo       copy this app into its own project
+                                        repo (~/Work/omarchy-lock-studio),
+                                        commit and push. Also a web UI button.
+"""
+
+import http.server
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import threading
+import datetime
+import hashlib
+import time
+import urllib.parse
+
+CONFIG_DIR = os.path.expanduser("~/.config/omarchy/lockscreen-customizer")
+BACKUP_DIR = os.path.join(CONFIG_DIR, "backups")
+SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
+INITIAL_BACKUP = os.path.join(BACKUP_DIR, "initial-LockView.qml")
+PORT = 8731
+
+QUOTES = [
+    "Talk is cheap. Show me the code. — Linus Torvalds",
+    "Programs must be written for people to read, and only incidentally for machines to execute. — Harold Abelson",
+    "Any fool can write code that a computer can understand. Good programmers write code that humans can understand. — Martin Fowler",
+    "First, solve the problem. Then, write the code. — John Johnson",
+    "Simplicity is the soul of efficiency. — Austin Freeman",
+    "Make it work, make it right, make it fast. — Kent Beck",
+    "The best error message is the one that never shows up. — Thomas Fuchs",
+    "Code is like humor. When you have to explain it, it's bad. — Cory House",
+    "Before software can be reusable it first has to be usable. — Ralph Johnson",
+    "Walking on water and developing software from a specification are easy if both are frozen. — Edward Berard",
+    "Premature optimization is the root of all evil. — Donald Knuth",
+    "There are two ways to write error-free programs; only the third one works. — Alan Perlis",
+    "Code never lies, comments sometimes do. — Ron Jeffries",
+    "Don't comment bad code — rewrite it. — Brian Kernighan",
+    "The function of good software is to make the complex appear simple. — Grady Booch",
+    "Programming isn't about what you know; it's about what you can figure out. — Chris Pine",
+    "The most damaging phrase in the language is 'We've always done it this way.' — Grace Hopper",
+    "A language that doesn't affect the way you think about programming is not worth knowing. — Alan Perlis",
+    "Deleted code is debugged code. — Jeff Sickel",
+    "If it doesn't work, it doesn't matter how fast it doesn't work. — Mich Ravera",
+    "Without requirements or design, programming is the art of adding bugs to an empty text file. — Louis Srygley",
+    "The only way to go fast is to go well. — Robert C. Martin",
+    "Don't let the perfect be the enemy of the good. — Voltaire",
+    "Software and cathedrals are much the same — first we build them, then we pray. — Sam Redwine",
+    "Debugging is like being a detective in a crime movie where you are also the murderer. — Filipe Fortes",
+    "If you can't explain it simply, you don't understand it well enough. — Albert Einstein",
+    "Refactor early, refactor often. — Anonymous",
+    "The glass is neither half full nor half empty; the container is twice as large as it needs to be. — Anonymous",
+    "A distributed system is one where a machine I've never heard of can make mine stop working. — Leslie Lamport",
+    "It works on my machine. — Every developer, ever",
+]
+
+# The optional face-unlock mark (omaFace's FaceGlyph), shipped inline so a
+# generated LockView.qml always has the component it references.
+FACE_GLYPH_QML = r"""import QtQuick
+
+// The omaFace mark, drawn in theme colours so it sits with the rest of the
+// shell: four lightly rounded corner brackets around a face made of square
+// pixels on a 9 x 9 grid, in the terminal look of the rest of Omarchy.
+//   idle      quiet pixel face, the scanner is ready
+//   scanning  brackets breathe while a band sweeps the grid and lights the
+//             pixels it passes, like a dot-matrix display
+//   success   the face's pixels give way to a pixel check mark, drawn in
+//   failure   a short shake with a row glitch in the error colour
+Item {
+  id: root
+
+  property string mode: "idle"
+  property color color: "white"
+  property color successColor: color
+  property color errorColor: "red"
+  property real lineWidth: Math.max(1.5, width / 26)
+
+  property real bracketInset: 0
+  property real scanPos: 0
+  property real scanAlpha: 0
+  property real faceAlpha: 1
+  property real checkProgress: 0
+  property real shake: 0
+  property real failMix: 0
+  property real glitch: 0
+
+  implicitWidth: 64
+  implicitHeight: 64
+
+  // Cells as [row, column] on the 9 x 9 grid.
+  readonly property var faceCells: [
+    [2, 2], [3, 2], [2, 6], [3, 6],          // eyes
+    [5, 2], [6, 3], [6, 4], [6, 5], [5, 6]   // mouth
+  ]
+  // Two pixels thick, in stroke order (down the short arm, up the long one).
+  readonly property var checkCells: [
+    [4, 1], [5, 1], [5, 2], [6, 2], [6, 3], [7, 3],
+    [5, 4], [6, 4], [4, 5], [5, 5], [3, 6], [4, 6], [2, 7], [3, 7]
+  ]
+
+  onModeChanged: applyState()
+  Component.onCompleted: applyState()
+
+  function applyState() {
+    breathe.stop()
+    sweep.stop()
+    if (mode === "scanning") {
+      checkIn.stop()
+      faceAlpha = 1
+      checkProgress = 0
+      failMix = 0
+      breathe.start()
+      sweep.start()
+    } else if (mode === "success") {
+      bracketReset.start()
+      scanFade.start()
+      checkIn.restart()
+    } else if (mode === "failure") {
+      bracketReset.start()
+      scanFade.start()
+      faceAlpha = 1
+      checkProgress = 0
+      headShake.restart()
+    } else {
+      bracketReset.start()
+      scanFade.start()
+      faceAlpha = 1
+      checkProgress = 0
+      failMix = 0
+    }
+  }
+
+  SequentialAnimation {
+    id: breathe
+    loops: Animation.Infinite
+    NumberAnimation { target: root; property: "bracketInset"; to: 3; duration: 650; easing.type: Easing.InOutSine }
+    NumberAnimation { target: root; property: "bracketInset"; to: 0; duration: 650; easing.type: Easing.InOutSine }
+  }
+
+  SequentialAnimation {
+    id: sweep
+    loops: Animation.Infinite
+    PropertyAction { target: root; property: "scanAlpha"; value: 1 }
+    NumberAnimation { target: root; property: "scanPos"; from: 0; to: 1; duration: 950; easing.type: Easing.InOutQuad }
+    NumberAnimation { target: root; property: "scanPos"; from: 1; to: 0; duration: 950; easing.type: Easing.InOutQuad }
+  }
+
+  NumberAnimation { id: bracketReset; target: root; property: "bracketInset"; to: 0; duration: 180; easing.type: Easing.OutQuad }
+  NumberAnimation { id: scanFade; target: root; property: "scanAlpha"; to: 0; duration: 160 }
+
+  SequentialAnimation {
+    id: checkIn
+    NumberAnimation { target: root; property: "faceAlpha"; to: 0; duration: 150; easing.type: Easing.OutQuad }
+    NumberAnimation { target: root; property: "checkProgress"; from: 0; to: 1; duration: 320; easing.type: Easing.Linear }
+  }
+
+  SequentialAnimation {
+    id: headShake
+    PropertyAction { target: root; property: "failMix"; value: 1 }
+    PropertyAction { target: root; property: "glitch"; value: 1 }
+    NumberAnimation { target: root; property: "shake"; to: -6; duration: 45; easing.type: Easing.OutQuad }
+    NumberAnimation { target: root; property: "shake"; to: 6; duration: 70; easing.type: Easing.InOutQuad }
+    PropertyAction { target: root; property: "glitch"; value: 0 }
+    NumberAnimation { target: root; property: "shake"; to: -4; duration: 70; easing.type: Easing.InOutQuad }
+    NumberAnimation { target: root; property: "shake"; to: 3; duration: 60; easing.type: Easing.InOutQuad }
+    NumberAnimation { target: root; property: "shake"; to: 0; duration: 55; easing.type: Easing.OutQuad }
+    PauseAnimation { duration: 450 }
+    NumberAnimation { target: root; property: "failMix"; to: 0; duration: 300 }
+  }
+
+  onBracketInsetChanged: canvas.requestPaint()
+  onScanPosChanged: canvas.requestPaint()
+  onScanAlphaChanged: canvas.requestPaint()
+  onFaceAlphaChanged: canvas.requestPaint()
+  onCheckProgressChanged: canvas.requestPaint()
+  onFailMixChanged: canvas.requestPaint()
+  onGlitchChanged: canvas.requestPaint()
+  onColorChanged: canvas.requestPaint()
+  onWidthChanged: canvas.requestPaint()
+  onHeightChanged: canvas.requestPaint()
+
+  function mix(a, b, t) {
+    return Qt.rgba(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, a.a + (b.a - a.a) * t)
+  }
+
+  Canvas {
+    id: canvas
+    anchors.fill: parent
+    anchors.leftMargin: root.shake
+    anchors.rightMargin: -root.shake
+    antialiasing: true
+    renderStrategy: Canvas.Cooperative
+
+    onPaint: {
+      var ctx = getContext("2d")
+      ctx.reset()
+      var s = Math.min(width, height) / 100
+      ctx.save()
+      ctx.translate((width - 100 * s) / 2, (height - 100 * s) / 2)
+      ctx.scale(s, s)
+
+      var base = root.mix(root.color, root.errorColor, root.failMix)
+      var success = root.checkProgress > 0
+
+      // Corner brackets: flat ends, a small corner radius.
+      ctx.lineCap = "butt"
+      ctx.lineJoin = "round"
+      ctx.lineWidth = root.lineWidth / s
+      ctx.strokeStyle = success ? root.successColor : base
+      var i = 7 + root.bracketInset
+      var len = 17, r = 3, far = 100 - i
+      ctx.beginPath()
+      ctx.moveTo(i, i + len); ctx.lineTo(i, i + r); ctx.quadraticCurveTo(i, i, i + r, i); ctx.lineTo(i + len, i)
+      ctx.moveTo(far - len, i); ctx.lineTo(far - r, i); ctx.quadraticCurveTo(far, i, far, i + r); ctx.lineTo(far, i + len)
+      ctx.moveTo(far, far - len); ctx.lineTo(far, far - r); ctx.quadraticCurveTo(far, far, far - r, far); ctx.lineTo(far - len, far)
+      ctx.moveTo(i + len, far); ctx.lineTo(i + r, far); ctx.quadraticCurveTo(i, far, i, far - r); ctx.lineTo(i, far - len)
+      ctx.stroke()
+
+      // The 9 x 9 pixel grid between the brackets.
+      var origin = 22.6, pitch = 6.2, size = 5.1
+      function cell(row, col, alpha, colour) {
+        if (alpha <= 0) return
+        var dx = root.glitch > 0 && (row % 3 === 1) ? (row % 2 ? 3 : -3) : 0
+        ctx.globalAlpha = Math.min(1, alpha)
+        ctx.fillStyle = colour
+        ctx.fillRect(origin + col * pitch + dx, origin + row * pitch, size, size)
+      }
+
+      // While scanning: the band lights the whole grid faintly where it passes.
+      var band = root.scanPos * 8
+      if (root.scanAlpha > 0) {
+        for (var gr = 0; gr < 9; gr++) {
+          var near = Math.max(0, 1 - Math.abs(gr - band) / 1.6)
+          if (near <= 0) continue
+          for (var gc = 0; gc < 9; gc++) cell(gr, gc, root.scanAlpha * near * 0.28, base)
+        }
+      }
+
+      // The face, brighter where the band is.
+      if (root.faceAlpha > 0) {
+        for (var k = 0; k < root.faceCells.length; k++) {
+          var fc = root.faceCells[k]
+          var lift = root.scanAlpha > 0 ? Math.max(0, 1 - Math.abs(fc[0] - band) / 1.6) : 0
+          cell(fc[0], fc[1], root.faceAlpha * (0.75 + 0.25 * lift), base)
+        }
+      }
+
+      // The check mark, one pixel after another along its stroke.
+      if (success) {
+        var n = root.checkCells.length
+        for (var j = 0; j < n; j++) {
+          var t = root.checkProgress * n - j
+          if (t <= 0) break
+          cell(root.checkCells[j][0], root.checkCells[j][1], t, root.successColor)
+        }
+      }
+      ctx.globalAlpha = 1
+      ctx.restore()
+    }
+  }
+}
+"""
+
+
+DEFAULT_SETTINGS = {
+    "clock_enabled": True,
+    "clock_format": "hh:mm AP",
+    "clock_show_seconds": False,
+    "clock_date": "dddd, MMMM d",
+    "clock_show_date": True,
+    "clock_tz": "",
+    "clock_scale": 1.6,
+    "clock_vpos": "top",
+    "font_family": "",
+    "clock_font": "",
+    "clock_weight": "bold",
+    "clock_spacing": 0,
+    "profile_enabled": True,
+    "profile_name": "joseph",
+    "profile_avatar": "",
+    "profile_show_host": True,
+    "profile_host": socket.gethostname(),
+    "profile_pos": "bottom-left",
+    "quotes_enabled": True,
+    "quote_interval": 12,
+    "quotes_pos": "bottom-center",
+    "quotes_big": False,
+    "show_welcome": True,
+    "welcome_text": "Welcome back, {name}",
+    "text_color_mode": "theme",
+    "text_color": "#ffffff",
+    "media_enabled": True,
+    "media_pos": "top-left",
+    "bg_image": "",
+    "bg_blur": 1.0,
+    "bg_dim": 0.25,
+}
+
+# QML Font weights for the clock, keyed by the value the UI stores.
+CLOCK_WEIGHTS = {
+    "regular": "Font.Normal",
+    "medium": "Font.Medium",
+    "semibold": "Font.DemiBold",
+    "bold": "Font.Bold",
+    "black": "Font.Black",
+}
+
+# ---------------------------------------------------------------------------
+# Filesystem helpers
+# ---------------------------------------------------------------------------
+
+def find_plugin_dir():
+    """Locate the user-cloned omarchy.lock plugin (~/.config/omarchy/plugins/*)."""
+    base = os.path.expanduser("~/.config/omarchy/plugins")
+    if not os.path.isdir(base):
+        return None
+    for name in os.listdir(base):
+        mpath = os.path.join(base, name, "manifest.json")
+        if not os.path.isfile(mpath):
+            continue
+        try:
+            m = json.load(open(mpath))
+        except Exception:
+            continue
+        if m.get("omarchy", {}).get("clonedFrom") == "omarchy.lock" or m.get("id", "").endswith(".lock"):
+            return os.path.join(base, name)
+    return None
+
+def ensure_initial_backup(lockview_path):
+    if lockview_path and os.path.isfile(lockview_path) and not os.path.isfile(INITIAL_BACKUP):
+        import shutil
+        shutil.copy2(lockview_path, INITIAL_BACKUP)
+
+def installed_fonts():
+    """Font family names for the Typography datalist, straight from fontconfig."""
+    try:
+        out = subprocess.run(["fc-list", ":", "family"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return []
+    fams = set()
+    for line in out.splitlines():
+        for fam in line.split(","):
+            fam = fam.strip()
+            if fam:
+                fams.add(fam)
+    return sorted(fams, key=str.lower)
+
+
+def ensure_face_glyph(plugin_dir):
+    """Write the bundled FaceGlyph.qml next to LockView.qml if it is missing."""
+    if not plugin_dir:
+        return None
+    path = os.path.join(plugin_dir, "FaceGlyph.qml")
+    try:
+        if os.path.isfile(path):
+            with open(path) as f:
+                if f.read() == FACE_GLYPH_QML:
+                    return path
+        with open(path, "w") as f:
+            f.write(FACE_GLYPH_QML)
+        return path
+    except Exception:
+        return None
+
+
+def load_settings():
+    if os.path.isfile(SETTINGS_PATH):
+        try:
+            s = json.load(open(SETTINGS_PATH))
+            merged = dict(DEFAULT_SETTINGS)
+            merged.update(s)
+            return merged
+        except Exception:
+            pass
+    return dict(DEFAULT_SETTINGS)
+
+def save_settings(s):
+    with open(SETTINGS_PATH, "w") as f:
+        json.dump(s, f, indent=2)
+
+def timestamp():
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+def backup_current(lockview_path, label="auto"):
+    if not lockview_path or not os.path.isfile(lockview_path):
+        return None
+    import shutil
+    dest = os.path.join(BACKUP_DIR, f"{label}-{timestamp()}-LockView.qml")
+    shutil.copy2(lockview_path, dest)
+    return dest
+
+def list_backups():
+    out = []
+    if os.path.isdir(BACKUP_DIR):
+        for fn in sorted(os.listdir(BACKUP_DIR), reverse=True):
+            if fn.endswith(".qml"):
+                p = os.path.join(BACKUP_DIR, fn)
+                out.append({"file": fn, "mtime": os.path.getmtime(p)})
+    return out
+
+def restore_backup(filename, lockview_path):
+    src = os.path.join(BACKUP_DIR, filename)
+    if not os.path.isfile(src):
+        return False, "backup not found"
+    import shutil
+    backup_current(lockview_path, label="pre-restore")
+    shutil.copy2(src, lockview_path)
+    return restart_shell()
+
+
+# ---------------------------------------------------------------------------
+# Project repo sync (keeps this app published on GitHub)
+# ---------------------------------------------------------------------------
+
+STUDIO_REPO = os.environ.get("LOCKSTUDIO_REPO", os.path.expanduser("~/Work/omarchy-lock-studio"))
+STUDIO_SCRIPT_REL = "omarchy-lock-studio"
+
+
+def git(repo, *args, timeout=30):
+    """Run git inside the project repo. Returns (ok, combined output)."""
+    try:
+        p = subprocess.run(["git"] + list(args), cwd=repo, capture_output=True,
+                           text=True, timeout=timeout)
+    except Exception as e:
+        return False, str(e)
+    return p.returncode == 0, (p.stdout + p.stderr).strip()
+
+
+def repo_status():
+    repo = STUDIO_REPO
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        return {"ok": False, "error": "no git repo at " + repo}
+    ok, branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    if not ok:
+        return {"ok": False, "error": branch}
+    _, last = git(repo, "log", "-1", "--format=%h %s")
+    _, dirty = git(repo, "status", "--porcelain")
+    _, remote = git(repo, "remote", "get-url", "origin")
+    ahead = ""
+    up_ok, up = git(repo, "rev-parse", "--abbrev-ref", "@{u}")
+    if up_ok:
+        _, ahead = git(repo, "rev-list", "--count", "@{u}..HEAD")
+    return {
+        "ok": True, "repo": repo, "branch": branch, "last": last,
+        "dirty": bool(dirty.strip()), "dirtyFiles": len(dirty.splitlines()),
+        "remote": remote, "ahead": ahead.strip(), "upstream": up if up_ok else "",
+    }
+
+
+def sync_repo():
+    """Copy this app into its own project repo, commit and push."""
+    import shutil
+    repo = STUDIO_REPO
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        return {"ok": False, "error": "no git repo at " + repo}
+
+    dest = os.path.join(repo, STUDIO_SCRIPT_REL)
+    shutil.copy2(os.path.realpath(__file__), dest)
+    os.chmod(dest, 0o755)
+
+    ok, out = git(repo, "add", "-A", STUDIO_SCRIPT_REL)
+    if not ok:
+        return {"ok": False, "error": "git add failed: " + out, "files": [STUDIO_SCRIPT_REL]}
+
+    staged, _ = git(repo, "diff", "--cached", "--quiet")
+    if staged:
+        return {"ok": True, "committed": False, "files": [STUDIO_SCRIPT_REL],
+                "detail": "already up to date — nothing changed"}
+
+    msg = "Sync lock studio " + datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    ok, out = git(repo, "commit", "-m", msg)
+    if not ok:
+        return {"ok": False, "error": "commit failed: " + out, "files": [STUDIO_SCRIPT_REL]}
+    _, commit = git(repo, "log", "-1", "--format=%h %s")
+
+    ok, push = git(repo, "push", "origin", "HEAD", timeout=90)
+    if not ok:
+        return {"ok": False, "files": [STUDIO_SCRIPT_REL], "commit": commit,
+                "error": "committed " + commit + " but push failed: " + push}
+    return {"ok": True, "committed": True, "commit": commit,
+            "files": [STUDIO_SCRIPT_REL], "detail": push.replace("\n", " ") or "pushed"}
+
+# ---------------------------------------------------------------------------
+# Theme + media
+# ---------------------------------------------------------------------------
+
+def active_theme_colors():
+    defaults = {
+        "background": "#101019",
+        "foreground": "#cdd6f4",
+        "accent": "#89b4fa",
+        "muted": "#6c7086",
+    }
+    try:
+        name = subprocess.check_output(["omarchy", "theme", "current"]).decode().strip()
+    except Exception:
+        return defaults
+    norm = name.lower().replace(" ", "-")
+    candidates = []
+    try:
+        d = subprocess.check_output(["omarchy", "theme", "dir", name]).decode().strip()
+        if d:
+            candidates.append(d)
+    except Exception:
+        pass
+    candidates += [
+        os.path.expanduser(f"~/.config/omarchy/themes/{norm}/colors.toml"),
+        f"/usr/share/omarchy/themes/{norm}/colors.toml",
+    ]
+    colors = {}
+    for c in candidates:
+        if os.path.isfile(c):
+            colors = parse_colors_toml(c)
+            if colors:
+                break
+    defaults.update(colors)
+    return defaults
+
+def parse_colors_toml(path):
+    out = {}
+    try:
+        text = open(path).read()
+    except Exception:
+        return out
+    for key in ("background", "foreground", "accent", "muted", "selection"):
+        m = re.search(rf'^\s*{key}\s*=\s*"([^"]+)"', text, re.MULTILINE)
+        if m:
+            out[key] = m.group(1)
+    return out
+
+def playerctl_snapshot():
+    try:
+        out = subprocess.check_output(
+            ["playerctl", "metadata", "--format", "{{title}}|||{{artist}}|||{{mpris:artUrl}}"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        return {"title": "", "artist": "", "art": "", "playing": False}
+    parts = out.split("|||")
+    title = (parts[0] or "").strip()
+    artist = (parts[1] or "").strip()
+    art = (parts[2] or "").strip()
+    try:
+        playing = subprocess.check_output(
+            ["playerctl", "status"], stderr=subprocess.DEVNULL
+        ).decode().strip().lower() == "playing"
+    except Exception:
+        playing = bool(title)
+    return {"title": title, "artist": artist, "art": art, "playing": playing}
+
+def restart_shell():
+    try:
+        subprocess.run(["omarchy", "restart", "shell"], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        return True, "restarted shell"
+    except Exception as e:
+        return False, str(e)
+
+def free_port(port):
+    """Best-effort: kill whatever process is holding the given TCP port so a new
+    instance can take over (prevents a stale server serving old code)."""
+    try:
+        out = subprocess.check_output(
+            ["ss", "-ltnp", "-H", f"sport = :{port}"], stderr=subprocess.DEVNULL
+        ).decode()
+        for line in out.splitlines():
+            m = re.search(r"pid=(\d+)", line)
+            if m:
+                try:
+                    os.kill(int(m.group(1)), 15)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def list_files(path):
+    """Safe directory listing under the user's home, for the in-page file picker."""
+    home = os.path.realpath(os.path.expanduser("~"))
+    base = os.path.realpath(os.path.expanduser(path)) if path else home
+    if not base.startswith(home):
+        base = home
+    if not os.path.isdir(base):
+        base = home
+    entries = []
+    try:
+        for name in sorted(os.listdir(base)):
+            if name.startswith("."):
+                continue
+            fp = os.path.join(base, name)
+            if os.path.isdir(fp):
+                entries.append({"name": name, "dir": True, "image": False})
+            elif name.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")):
+                entries.append({"name": name, "dir": False, "image": True})
+    except Exception:
+        pass
+    parent = os.path.dirname(base)
+    return {
+        "path": base,
+        "parent": parent if parent.startswith(home) else "",
+        "entries": entries,
+    }
+
+def target_size(kind):
+    if kind == "avatar":
+        return (512, 512)
+    # Background: cover the largest connected monitor.
+    try:
+        out = subprocess.check_output(["hyprctl", "-j", "monitors"]).decode()
+        mons = json.loads(out)
+        if isinstance(mons, dict):
+            mons = [mons]
+        best = [1920, 1080]
+        for m in mons:
+            w = int(m.get("width", 0) or 0)
+            h = int(m.get("height", 0) or 0)
+            if w * h > best[0] * best[1]:
+                best = [w, h]
+        return tuple(best)
+    except Exception:
+        return (1920, 1080)
+
+def process_image(path, kind):
+    """Read an image; if it is smaller than the target for its kind, upscale it
+    (LANCZOS) and cache the result in the customizer's assets dir. Returns the
+    path to use (original if no upscaling was needed)."""
+    src = os.path.realpath(os.path.expanduser(path))
+    if not os.path.isfile(src):
+        return {"path": path, "upscaled": False, "error": "not found"}
+    try:
+        from PIL import Image
+        with Image.open(src) as im:
+            w, h = im.size
+    except Exception as e:
+        return {"path": path, "upscaled": False, "error": str(e)}
+    target = target_size(kind)
+    factor = max(target[0] / w, target[1] / h, 1.0)
+    if factor <= 1.02:
+        return {"path": path, "upscaled": False}
+    new_size = (int(round(w * factor)), int(round(h * factor)))
+    assets = os.path.join(CONFIG_DIR, "assets")
+    os.makedirs(assets, exist_ok=True)
+    key = hashlib.sha1((src + str(os.path.getmtime(src))).encode()).hexdigest()[:12]
+    out_path = os.path.join(assets, f"{kind}-{key}.png")
+    if os.path.isfile(out_path):
+        return {"path": out_path, "upscaled": True}
+    try:
+        with Image.open(src) as im:
+            im = im.convert("RGBA") if im.mode in ("RGBA", "LA", "P") else im.convert("RGB")
+            im = im.resize(new_size, Image.LANCZOS)
+            im.save(out_path)
+    except Exception as e:
+        return {"path": path, "upscaled": False, "error": str(e)}
+    return {"path": out_path, "upscaled": True}
+
+# ---------------------------------------------------------------------------
+# QML template
+# ---------------------------------------------------------------------------
+
+TEMPLATE = r'''import QtQuick
+import QtQuick.Effects
+import qs.Commons
+import qs.Ui
+import Quickshell
+import Quickshell.Io
+
+Item {
+  id: root
+
+  property string backgroundPath: ""
+  property int backgroundVersion: 0
+  property bool fingerprintConfigured: false
+  property bool authenticatingPassword: false
+  property string failureMessage: ""
+  property int failedAttempts: 0
+  property bool inputEnabled: true
+  property bool loadBackground: true
+  property string passwordText: ""
+  property bool syncingPasswordText: false
+
+  // omaFace, ported from io.github.l0adn9.omaface so it lives inside this
+  // customized view: faceState drives the mark, faceLive carries the webcam's
+  // head-turn hints, faceAvailable hides the mark when no face is enrolled.
+  property string faceState: "idle"
+  property string faceLive: ""
+  property bool faceAvailable: false
+
+  // --- omarchy-lock-studio settings (generated, do not edit by hand) ---
+  property string customBackground: __BG_IMAGE__
+  property real customBlur: __BG_BLUR__
+  property real customDim: __BG_DIM__
+  property color lockTextColor: __LOCK_TEXT_COLOR__
+  property color lockPlaceholderColor: __LOCK_PLACEHOLDER_COLOR__
+  property string customFontFamily: __FONT_FAMILY__
+  property string customClockFont: __CLOCK_FONT__
+  property int customClockWeight: __CLOCK_WEIGHT__
+  property real customClockSpacing: __CLOCK_SPACING__
+
+  // An empty family means "the Omarchy theme font". The clock falls back to the
+  // general text font before that, so one field can style everything.
+  readonly property string textFontFamily: customFontFamily !== "" ? customFontFamily : Style.font.family
+  readonly property string clockFontFamily: customClockFont !== "" ? customClockFont : textFontFamily
+
+  readonly property string placeholderText: "Enter Password"
+  readonly property int fieldWidth: 381
+  readonly property int fieldHeight: 67
+  readonly property int outlineThickness: 3
+  readonly property int fieldFontSize: Math.round(Style.font.heading * 1.125)
+  readonly property int passwordDotFontSize: Math.round(Style.font.heading * 1.33)
+  readonly property int passwordDotLetterSpacing: Math.round(Style.font.heading * 0.19)
+  readonly property real fingerprintReserve: fingerprintConfigured ? Math.round(fingerprintIcon.implicitWidth + 12) : 0
+  readonly property real passwordDotScale: dotMetrics.advanceWidth > 0
+    ? Math.min(1, (passwordInput.width - 4) / dotMetrics.advanceWidth)
+    : 1
+  readonly property bool showPasswordCursor: inputEnabled && !authenticatingPassword && failureMessage.length === 0
+  readonly property bool errorState: failureMessage.length > 0
+  readonly property var inputBorderSpec: errorState
+    ? Border.surfaceSpec("lock", "border-error", Color.lock.borderError, root.outlineThickness, "border-alpha")
+    : Border.surfaceSpec("lock", "border-active", Color.lock.borderActive, root.outlineThickness, "border-alpha")
+
+  signal submitPassword(string password)
+  signal passwordTextEdited(string password)
+  signal clearFailureRequested()
+  signal wakeRequested()
+  signal faceRequested()
+
+  function fileUrl(path) {
+    if (!path) return ""
+    var encoded = String(path).split("/").map(encodeURIComponent).join("/")
+    return "file://" + encoded + "?v=" + backgroundVersion
+  }
+
+  function forcePasswordFocus() {
+    passwordInput.forceActiveFocus()
+  }
+
+  function clearPassword() {
+    passwordTextEdited("")
+  }
+
+  function syncPasswordText() {
+    if (passwordInput.text === passwordText) return
+    syncingPasswordText = true
+    passwordInput.text = passwordText
+    syncingPasswordText = false
+  }
+
+  onPasswordTextChanged: syncPasswordText()
+  onInputEnabledChanged: {
+    if (inputEnabled) Qt.callLater(forcePasswordFocus)
+  }
+  Component.onCompleted: {
+    syncPasswordText()
+    if (inputEnabled) Qt.callLater(forcePasswordFocus)
+  }
+
+  TextMetrics {
+    id: dotMetrics
+    font.family: root.textFontFamily
+    font.pixelSize: root.passwordDotFontSize
+    font.letterSpacing: root.passwordDotLetterSpacing
+    text: "●".repeat(passwordInput.text.length)
+  }
+
+  Rectangle {
+    anchors.fill: parent
+    color: Color.background
+
+    Image {
+      id: wallpaper
+      anchors.fill: parent
+      source: root.loadBackground ? root.fileUrl(root.customBackground !== "" ? root.customBackground : root.backgroundPath) : ""
+      fillMode: Image.PreserveAspectCrop
+      asynchronous: true
+      cache: false
+      sourceSize.width: width
+      sourceSize.height: height
+    }
+
+    MultiEffect {
+      anchors.fill: wallpaper
+      source: wallpaper
+      autoPaddingEnabled: false
+      blurEnabled: root.loadBackground && wallpaper.status === Image.Ready
+      blur: root.customBlur
+      blurMax: 128
+      blurMultiplier: 1.25
+      contrast: -0.08
+    }
+
+    Rectangle {
+      anchors.fill: parent
+      color: "#000000"
+      opacity: root.customDim
+      visible: root.customDim > 0
+      enabled: false
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      hoverEnabled: true
+      onClicked: { root.wakeRequested(); root.forcePasswordFocus() }
+      onPositionChanged: root.wakeRequested()
+    }
+
+    // omaFace: the mark sits above the field and animates while the IR camera
+    // looks. Clicking it asks for another scan. Hidden unless a face is enrolled.
+    Rectangle {
+      id: faceTile
+      width: Math.round(root.fieldHeight * 1.25)
+      height: width
+      radius: Style.cornerRadius
+      color: Color.lock.background
+      anchors.horizontalCenter: inputField.horizontalCenter
+      anchors.bottom: inputField.top
+      anchors.bottomMargin: Math.round(root.fieldHeight * 0.45)
+      visible: (root.faceAvailable && root.faceState !== "unavailable") || root.faceState === "success"
+      opacity: visible ? 1 : 0
+
+      FaceGlyph {
+        objectName: "faceIndicator"
+        anchors.centerIn: parent
+        width: Math.round(parent.width * 0.66)
+        height: width
+        mode: root.faceState
+        opacity: root.faceState === "idle" ? 0.6 : 1
+        color: root.lockTextColor
+        successColor: Color.lock.borderActive
+        errorColor: Color.lock.textError
+        Behavior on opacity { NumberAnimation { duration: 180 } }
+      }
+
+      MouseArea {
+        anchors.fill: parent
+        cursorShape: Qt.PointingHandCursor
+        onClicked: {
+          root.wakeRequested()
+          root.faceRequested()
+        }
+      }
+    }
+
+    Text {
+      anchors.horizontalCenter: faceTile.horizontalCenter
+      anchors.bottom: faceTile.top
+      anchors.bottomMargin: Math.round(root.fieldHeight * 0.25)
+      visible: faceTile.visible && (root.faceLive !== "" || root.faceState === "scanning" || root.faceState === "attention")
+      text: root.faceLive === "turn-left" ? "←  Turn your head left"
+        : root.faceLive === "turn-right" ? "Turn your head right  →"
+        : root.faceLive === "turn-back" ? "Face the camera again"
+        : root.faceState === "attention" ? "Open your eyes and look at the screen" : "Look at the screen"
+      color: root.lockTextColor
+      opacity: root.faceLive !== "" ? 1 : 0.7
+      font.family: root.textFontFamily
+      font.pixelSize: root.faceLive !== "" ? Style.font.body : Style.font.bodySmall
+    }
+
+    BorderSurface {
+      id: inputField
+      width: root.fieldWidth
+      height: root.fieldHeight
+      anchors.centerIn: parent
+      color: Color.lock.background
+      borderSpec: root.inputBorderSpec
+      radius: Style.cornerRadius
+      clip: true
+
+      TextInput {
+        id: passwordInput
+        anchors.fill: parent
+        anchors.topMargin: inputField.borderTop
+        anchors.rightMargin: inputField.borderRight + 18 + root.fingerprintReserve
+        anchors.bottomMargin: inputField.borderBottom
+        anchors.leftMargin: inputField.borderLeft + 18 + root.fingerprintReserve
+        verticalAlignment: TextInput.AlignVCenter
+        horizontalAlignment: TextInput.AlignHCenter
+        activeFocusOnPress: true
+        clip: true
+        enabled: root.inputEnabled && !root.authenticatingPassword
+        readOnly: root.authenticatingPassword
+        echoMode: TextInput.Password
+        passwordCharacter: "●"
+        passwordMaskDelay: 0
+        color: root.lockTextColor
+        selectionColor: Color.lock.selection
+        selectedTextColor: root.lockTextColor
+        font.family: root.textFontFamily
+        font.pixelSize: text.length > 0 ? Math.max(1, Math.floor(root.passwordDotFontSize * root.passwordDotScale)) : root.fieldFontSize
+        font.letterSpacing: text.length > 0 ? root.passwordDotLetterSpacing * root.passwordDotScale : 0
+        cursorVisible: activeFocus && root.showPasswordCursor && text.length > 0
+        cursorDelegate: Rectangle {
+          width: 2
+          color: root.lockTextColor
+          visible: passwordInput.cursorVisible
+        }
+
+        onTextChanged: {
+          if (!root.syncingPasswordText) root.passwordTextEdited(text)
+          if (text.length > 0) {
+            root.wakeRequested()
+          }
+          if (text.length > 0 && root.failureMessage.length > 0) root.clearFailureRequested()
+        }
+
+        onAccepted: {
+          var submitted = root.passwordText
+          root.passwordTextEdited("")
+          if (submitted.length > 0) root.submitPassword(submitted)
+        }
+
+        Keys.onPressed: function(event) {
+          root.wakeRequested()
+          if (event.key === Qt.Key_Escape || (event.modifiers & Qt.ControlModifier && event.key === Qt.Key_U)) {
+            root.passwordTextEdited("")
+            event.accepted = true
+          }
+        }
+      }
+
+      Text {
+        anchors.fill: passwordInput
+        text: root.authenticatingPassword ? "Checking…" : (root.failureMessage.length > 0 ? root.failureMessage : root.placeholderText)
+        visible: passwordInput.text.length === 0
+        color: root.authenticatingPassword ? root.lockTextColor : (root.failureMessage.length > 0 ? Color.lock.textError : root.lockPlaceholderColor)
+        font.family: root.textFontFamily
+        font.pixelSize: root.fieldFontSize
+        font.italic: !root.authenticatingPassword && root.failureMessage.length > 0
+        horizontalAlignment: Text.AlignHCenter
+        verticalAlignment: Text.AlignVCenter
+        elide: Text.ElideRight
+      }
+
+      Text {
+        id: fingerprintIcon
+        objectName: "fingerprintIndicator"
+        anchors.right: parent.right
+        anchors.rightMargin: inputField.borderRight + 18
+        anchors.verticalCenter: parent.verticalCenter
+        visible: root.fingerprintConfigured
+        text: "󰈷"
+        color: root.lockPlaceholderColor
+        font.family: root.textFontFamily
+        font.pixelSize: Math.round(root.fieldFontSize * 1.1)
+        horizontalAlignment: Text.AlignHCenter
+        verticalAlignment: Text.AlignVCenter
+      }
+    }
+
+    // ===================== Clock =====================
+    Column {
+      id: clockBox
+      visible: __CLOCK_ENABLED__
+      spacing: 6
+      anchors.horizontalCenter: parent.horizontalCenter
+      anchors.top: (__CLOCK_VPOS__ === "top") ? parent.top : undefined
+      anchors.bottom: (__CLOCK_VPOS__ === "top") ? undefined : parent.bottom
+      anchors.topMargin: 64
+      anchors.bottomMargin: 64
+      Text {
+        id: clkTime
+        color: root.lockTextColor
+        font.family: root.clockFontFamily
+        font.pixelSize: Math.round(Style.font.heading * __CLOCK_SCALE__)
+        font.weight: root.customClockWeight
+        font.letterSpacing: root.customClockSpacing
+        text: ""
+      }
+      Text {
+        visible: __CLOCK_SHOW_DATE__
+        color: root.lockPlaceholderColor
+        font.family: root.clockFontFamily
+        font.pixelSize: Math.round(Style.font.heading * 0.9)
+        text: ""
+        id: clkDate
+      }
+      Component.onCompleted: {
+        var d = new Date()
+        var tz = (__CLOCK_TZ__ !== "") ? __CLOCK_TZ__ : undefined
+        clkTime.text = d.toLocaleTimeString(Qt.locale(), __CLOCK_FORMAT__, undefined, tz)
+        clkDate.text = d.toLocaleDateString(Qt.locale(), __CLOCK_DATE__, undefined, tz)
+      }
+      Timer {
+        interval: 1000
+        running: __CLOCK_ENABLED__
+        repeat: true
+        onTriggered: {
+          var d = new Date()
+          var tz = (__CLOCK_TZ__ !== "") ? __CLOCK_TZ__ : undefined
+          clkTime.text = d.toLocaleTimeString(Qt.locale(), __CLOCK_FORMAT__, undefined, tz)
+          clkDate.text = d.toLocaleDateString(Qt.locale(), __CLOCK_DATE__, undefined, tz)
+        }
+      }
+    }
+
+    // ===================== User profile =====================
+    Row {
+      id: profBox
+      visible: __PROFILE_ENABLED__
+      property string welcomeResolved: __WELCOME_TEXT__.replace("{name}", __PROFILE_NAME__)
+      spacing: 16
+      anchors.left: (__PROFILE_POS__.indexOf("left") >= 0) ? parent.left : undefined
+      anchors.right: (__PROFILE_POS__.indexOf("right") >= 0) ? parent.right : undefined
+      anchors.top: (__PROFILE_POS__.indexOf("top") >= 0) ? parent.top : undefined
+      anchors.bottom: (__PROFILE_POS__.indexOf("bottom") >= 0) ? parent.bottom : undefined
+      anchors.margins: 56
+      Item {
+        width: 72; height: 72
+        Rectangle {
+          anchors.fill: parent
+          radius: 36
+          color: Color.lock.background
+          clip: true
+          Image {
+            anchors.fill: parent
+            source: (__PROFILE_AVATAR__ !== "") ? __PROFILE_AVATAR__ : ""
+            fillMode: Image.PreserveAspectCrop
+            visible: __PROFILE_AVATAR__ !== ""
+          }
+          Text {
+            anchors.centerIn: parent
+            visible: __PROFILE_AVATAR__ === ""
+            text: (__PROFILE_NAME__ !== "" ? __PROFILE_NAME__.charAt(0).toUpperCase() : "?")
+            color: root.lockTextColor
+            font.family: root.textFontFamily
+            font.pixelSize: 34
+            font.bold: true
+          }
+        }
+      }
+      Column {
+        spacing: 2
+        anchors.verticalCenter: parent.verticalCenter
+        Text {
+          visible: __SHOW_WELCOME__
+          text: profBox.welcomeResolved
+          color: root.lockTextColor
+          font.family: root.textFontFamily
+          font.pixelSize: Math.round(Style.font.heading * 0.9)
+          font.bold: true
+        }
+        Text {
+          visible: __PROFILE_SHOW_HOST__
+          text: __PROFILE_HOST__
+          color: root.lockPlaceholderColor
+          font.family: root.textFontFamily
+          font.pixelSize: Math.round(Style.font.heading * 0.7)
+        }
+      }
+    }
+
+    // ===================== Dev quotes =====================
+    Column {
+      id: quoteBox
+      visible: __QUOTES_ENABLED__
+      width: Math.min(parent.width * 0.7, 900)
+      anchors.horizontalCenter: parent.horizontalCenter
+      anchors.top: (__QUOTES_POS__.indexOf("top") >= 0) ? parent.top : undefined
+      anchors.bottom: (__QUOTES_POS__.indexOf("top") >= 0) ? undefined : parent.bottom
+      anchors.topMargin: 56
+      anchors.bottomMargin: 56
+      property var quotes: __QUOTES_LIST__
+      property int quoteIdx: 0
+      Text {
+        id: quoteText
+        width: parent.width
+        wrapMode: Text.WrapAtWordBoundaryOrAnywhere
+        horizontalAlignment: Text.AlignHCenter
+        color: root.lockTextColor
+        font.family: root.textFontFamily
+        font.pixelSize: Math.round(Style.font.heading * (__QUOTES_BIG__ ? 1.15 : 0.8))
+        font.italic: true
+        text: ""
+      }
+      Text {
+        id: quoteAuthor
+        width: parent.width
+        wrapMode: Text.Wrap
+        horizontalAlignment: Text.AlignHCenter
+        color: root.lockPlaceholderColor
+        font.family: root.textFontFamily
+        font.pixelSize: Math.round(Style.font.heading * (__QUOTES_BIG__ ? 0.85 : 0.6))
+        text: ""
+      }
+      Component.onCompleted: {
+        var q0 = quoteBox.quotes[quoteBox.quoteIdx % quoteBox.quotes.length]
+        quoteBox.quoteIdx = (quoteBox.quoteIdx + 1) % quoteBox.quotes.length
+        var s0 = q0.lastIndexOf(" — ")
+        if (s0 < 0) s0 = q0.lastIndexOf(" - ")
+        if (s0 >= 0) { quoteText.text = q0.substring(0, s0); quoteAuthor.text = q0.substring(s0 + 3) }
+        else { quoteText.text = q0; quoteAuthor.text = "" }
+      }
+      Timer {
+        interval: __QUOTE_INTERVAL__ * 1000
+        running: __QUOTES_ENABLED__
+        repeat: true
+        onTriggered: {
+          var q = quoteBox.quotes[quoteBox.quoteIdx % quoteBox.quotes.length]
+          quoteBox.quoteIdx = (quoteBox.quoteIdx + 1) % quoteBox.quotes.length
+          var sep = q.lastIndexOf(" — ")
+          if (sep < 0) sep = q.lastIndexOf(" - ")
+          if (sep >= 0) { quoteText.text = q.substring(0, sep); quoteAuthor.text = q.substring(sep + 3) }
+          else { quoteText.text = q; quoteAuthor.text = "" }
+        }
+      }
+    }
+
+    // ===================== MPRIS media =====================
+    Row {
+      id: mediaBox
+      visible: __MEDIA_ENABLED__ && mediaTitle !== ""
+      spacing: 12
+      anchors.left: (__MEDIA_POS__.indexOf("left") >= 0) ? parent.left : undefined
+      anchors.right: (__MEDIA_POS__.indexOf("right") >= 0) ? parent.right : undefined
+      anchors.top: (__MEDIA_POS__.indexOf("top") >= 0) ? parent.top : undefined
+      anchors.bottom: (__MEDIA_POS__.indexOf("bottom") >= 0) ? parent.bottom : undefined
+      anchors.horizontalCenter: (__MEDIA_POS__.indexOf("center") >= 0) ? parent.horizontalCenter : undefined
+      anchors.margins: 56
+      property string mediaTitle: ""
+      property string mediaArtist: ""
+      property string mediaArt: ""
+      Item {
+        width: 56; height: 56
+        Rectangle {
+          anchors.fill: parent
+          radius: 8
+          color: Color.lock.background
+          clip: true
+          Image {
+            anchors.fill: parent
+            source: mediaBox.mediaArt
+            fillMode: Image.PreserveAspectCrop
+            visible: mediaBox.mediaArt !== ""
+          }
+        }
+      }
+      Column {
+        spacing: 2
+        anchors.verticalCenter: parent.verticalCenter
+        Text {
+          text: mediaBox.mediaTitle
+          color: root.lockTextColor
+          font.family: root.textFontFamily
+          font.pixelSize: Math.round(Style.font.heading * 0.75)
+          font.bold: true
+          width: 280
+          elide: Text.ElideRight
+        }
+        Text {
+          text: mediaBox.mediaArtist
+          color: root.lockPlaceholderColor
+          font.family: root.textFontFamily
+          font.pixelSize: Math.round(Style.font.heading * 0.6)
+          width: 280
+          elide: Text.ElideRight
+        }
+      }
+      Process {
+        id: mediaProc
+        command: ["playerctl", "metadata", "--format", "{{title}}|||{{artist}}|||{{mpris:artUrl}}"]
+        running: true
+        stdout: StdioCollector {
+          waitForEnd: true
+          onStreamFinished: {
+            var p = (text || "").split("|||")
+            mediaBox.mediaTitle = (p[0] || "").trim()
+            mediaBox.mediaArtist = (p[1] || "").trim()
+            mediaBox.mediaArt = (p[2] || "").trim()
+          }
+        }
+      }
+      Timer { interval: 1500; running: __MEDIA_ENABLED__; repeat: true; onTriggered: mediaProc.running = true }
+    }
+  }
+}
+'''
+
+def with_alpha(hexcolor, a):
+    h = hexcolor.lstrip("#")
+    if len(h) == 3:
+        h = h[0]*2 + h[1]*2 + h[2]*2
+    r, g, b = h[0:2], h[2:4], h[4:6]
+    aa = "%02x" % max(0, min(255, int(round(a * 255))))
+    return "#" + r + g + b + aa
+
+
+def effective_bg(s):
+    bg = s.get("bg_image", "")
+    if bg:
+        return bg.replace("file://", "")
+    return active_theme_colors().get("background", "#000000")
+
+
+def readable_text_color(bg):
+    r = g = b = 0
+    n = 1
+    if bg and (bg.startswith("/") or "://" in bg):
+        try:
+            from PIL import Image
+            with Image.open(os.path.expanduser(bg.replace("file://", ""))) as im:
+                im = im.convert("RGB").resize((24, 24))
+                px = list(im.getdata())
+                r = sum(p[0] for p in px); g = sum(p[1] for p in px); b = sum(p[2] for p in px)
+                n = len(px)
+        except Exception:
+            r = g = b = 128; n = 1
+    elif bg and bg.startswith("#"):
+        h = bg.lstrip("#")
+        if len(h) == 3:
+            h = h[0]*2 + h[1]*2 + h[2]*2
+        r = int(h[0:2], 16); g = int(h[2:4], 16); b = int(h[4:6], 16); n = 1
+    lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / (n * 255.0)
+    return "#000000" if lum > 0.5 else "#ffffff"
+
+
+def effective_clock_format(fmt, show_seconds):
+    fmt = (fmt or "hh:mm AP").strip() or "hh:mm AP"
+    if not show_seconds:
+        return fmt
+    if "ss" in fmt:
+        return fmt
+    if "mm" in fmt:
+        return fmt.replace("mm", "mm:ss", 1)
+    return fmt + ":ss"
+
+
+def render_lockview(s):
+    def qstr(v):
+        return json.dumps(v)
+    def qbool(v):
+        return "true" if v else "false"
+    def qnum(v):
+        return str(v)
+    bg = s.get("bg_image", "")
+    if bg:
+        bg = os.path.expanduser(bg)
+    avatar = s.get("profile_avatar", "")
+    if avatar:
+        avatar = os.path.expanduser(avatar)
+    mode = s.get("text_color_mode", "theme")
+    if mode == "theme":
+        lock_text = "Color.lock.text"
+        lock_ph = "Color.lock.placeholder"
+    else:
+        if mode == "custom":
+            base = s.get("text_color") or "#ffffff"
+        else:
+            base = readable_text_color(effective_bg(s))
+        lock_text = json.dumps(base)
+        lock_ph = json.dumps(with_alpha(base, 0.6))
+    sub = {
+        "__CLOCK_ENABLED__": qbool(s["clock_enabled"]),
+        "__CLOCK_FORMAT__": qstr(effective_clock_format(s.get("clock_format", "hh:mm AP"), s.get("clock_show_seconds", False))),
+        "__CLOCK_DATE__": qstr(s["clock_date"]),
+        "__CLOCK_SHOW_DATE__": qbool(s["clock_show_date"]),
+        "__CLOCK_TZ__": qstr(s["clock_tz"]),
+        "__CLOCK_SCALE__": qnum(s["clock_scale"]),
+        "__CLOCK_VPOS__": qstr(s["clock_vpos"]),
+        "__FONT_FAMILY__": qstr(s.get("font_family", "")),
+        "__CLOCK_FONT__": qstr(s.get("clock_font", "")),
+        "__CLOCK_WEIGHT__": CLOCK_WEIGHTS.get(str(s.get("clock_weight", "bold")).lower(), "Font.Bold"),
+        "__CLOCK_SPACING__": qnum(float(s.get("clock_spacing", 0) or 0)),
+        "__PROFILE_ENABLED__": qbool(s["profile_enabled"]),
+        "__PROFILE_NAME__": qstr(s["profile_name"]),
+        "__PROFILE_AVATAR__": qstr(avatar),
+        "__PROFILE_SHOW_HOST__": qbool(s["profile_show_host"]),
+        "__PROFILE_HOST__": qstr(s["profile_host"]),
+        "__PROFILE_POS__": qstr(s["profile_pos"]),
+        "__SHOW_WELCOME__": qbool(s["show_welcome"]),
+        "__WELCOME_TEXT__": qstr(s["welcome_text"]),
+        "__QUOTES_ENABLED__": qbool(s["quotes_enabled"]),
+        "__QUOTE_INTERVAL__": qnum(int(s["quote_interval"])),
+        "__QUOTES_POS__": qstr(s["quotes_pos"]),
+        "__QUOTES_BIG__": qbool(s["quotes_big"]),
+        "__MEDIA_ENABLED__": qbool(s["media_enabled"]),
+        "__MEDIA_POS__": qstr(s["media_pos"]),
+        "__BG_IMAGE__": qstr(bg),
+        "__BG_BLUR__": qnum(s["bg_blur"]),
+        "__BG_DIM__": qnum(s["bg_dim"]),
+        "__LOCK_TEXT_COLOR__": lock_text,
+        "__LOCK_PLACEHOLDER_COLOR__": lock_ph,
+        "__QUOTES_LIST__": json.dumps(QUOTES),
+    }
+    out = TEMPLATE
+    for k, v in sub.items():
+        out = out.replace(k, v)
+    return out
+
+# ---------------------------------------------------------------------------
+# Web UI
+# ---------------------------------------------------------------------------
+
+HTML = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Omarchy Lock Studio</title>
+<style>
+  :root {
+    --bg: #101019; --fg: #cdd6f4; --accent: #89b4fa; --muted: #6c7086;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: "JetBrains Mono Nerd Font", ui-monospace, monospace;
+    background: #0a0a0f; color: var(--fg); display: flex; height: 100vh;
+  }
+  #panel {
+    width: 380px; min-width: 380px; overflow-y: auto; padding: 18px;
+    background: #14141c; border-right: 1px solid #26263a;
+  }
+  #stage { flex: 1; display: flex; align-items: center; justify-content: center; padding: 24px; }
+  h1 { font-size: 16px; margin: 0 0 4px; color: var(--accent); }
+  .sub { font-size: 11px; color: var(--muted); margin-bottom: 16px; }
+  .group { border: 1px solid #26263a; border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+  .group > h2 { font-size: 12px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); }
+  label { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; margin: 7px 0; }
+  label span { color: var(--fg); }
+  input[type=text], select {
+    background: #0d0d14; color: var(--fg); border: 1px solid #2e2e44;
+    border-radius: 6px; padding: 5px 7px; font-family: inherit; font-size: 12px; width: 180px;
+  }
+  input[type=range] { width: 150px; }
+  input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); }
+  .btns { display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+  button {
+    background: var(--accent); color: #0a0a0f; border: 0; border-radius: 8px;
+    padding: 8px 12px; font-family: inherit; font-weight: bold; font-size: 12px; cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--fg); border: 1px solid #2e2e44; }
+  button.danger { background: #f38ba8; }
+  /* Lock preview */
+  #screen {
+    position: relative; width: 100%; max-width: 900px; aspect-ratio: 16/9;
+    border-radius: 16px; overflow: hidden; background: var(--bg);
+    box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  }
+  #screen .bg { position: absolute; inset: 0; background-size: cover; background-position: center; filter: blur(8px); transform: scale(1.1); }
+  #screen .dim { position: absolute; inset: 0; background: #000; opacity: 0.25; }
+  .pw {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
+    width: 300px; height: 52px; border-radius: 12px; background: rgba(255,255,255,.06);
+    border: 2px solid var(--accent); display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 14px; letter-spacing: 2px;
+  }
+  .w-clock { position: absolute; left: 50%; transform: translateX(-50%); text-align: center; color: var(--fg); }
+  .w-clock .t { font-weight: bold; }
+  .w-clock .d { color: var(--muted); }
+  .w-profile { position: absolute; display: flex; gap: 12px; align-items: center; color: var(--fg); }
+  .w-profile .av { width: 52px; height: 52px; border-radius: 50%; background: rgba(255,255,255,.08); display:flex; align-items:center; justify-content:center; font-weight:bold; overflow:hidden; }
+  .w-profile .av img { width:100%; height:100%; object-fit: cover; }
+  .w-profile .nm { font-weight: bold; }
+  .w-profile .ho { color: var(--muted); font-size: 12px; }
+  .w-quote { position: absolute; left: 50%; transform: translateX(-50%); width: 70%; text-align: center; color: var(--fg); font-style: italic; }
+  .w-quote .a { color: var(--muted); font-style: normal; font-size: 12px; margin-top: 4px; }
+  .w-media { position: absolute; display: flex; gap: 10px; align-items: center; color: var(--fg); }
+  .w-media .art { width: 44px; height: 44px; border-radius: 8px; background: rgba(255,255,255,.08); background-size: cover; }
+  .w-media .ti { font-weight: bold; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .w-media .ar { color: var(--muted); font-size: 12px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: #1e1e2e; border:1px solid var(--accent); color: var(--fg); padding: 8px 14px; border-radius: 8px; font-size: 12px; opacity: 0; transition: opacity .3s; }
+  .toast.show { opacity: 1; }
+  .hint { font-size: 10px; color: var(--muted); margin-top: 6px; line-height: 1.4; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .row label { flex: 1; }
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: center; justify-content: center; z-index: 50; }
+  .modal-box { width: 540px; max-height: 72vh; background: #14141c; border: 1px solid #2e2e44; border-radius: 12px; display: flex; flex-direction: column; overflow: hidden; }
+  .modal-head { display: flex; align-items: center; gap: 8px; padding: 10px; border-bottom: 1px solid #2e2e44; font-size: 12px; }
+  .modal-head #picker-path { flex: 1; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .modal-list { overflow-y: auto; padding: 6px; }
+  .pick { padding: 8px 10px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+  .pick:hover { background: #1e1e2e; }
+  .pick.dir { color: var(--accent); font-weight: bold; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <h1>Omarchy Lock Studio</h1>
+  <div class="sub">Customize your Quickshell lock screen — safely.</div>
+
+  <div class="group">
+    <h2>Clock</h2>
+    <label><span>Enabled</span><input type="checkbox" id="clock_enabled"></label>
+    <label><span>Time format</span><input type="text" id="clock_format" value="hh:mm AP"></label>
+    <label><span>Show seconds</span><input type="checkbox" id="clock_show_seconds"></label>
+    <label><span>Show date</span><input type="checkbox" id="clock_show_date"></label>
+    <label><span>Date format</span><input type="text" id="clock_date" value="dddd, MMMM d"></label>
+    <label><span>Timezone</span><input type="text" id="clock_tz" placeholder="(system)"></label>
+    <label><span>Size</span><input type="range" id="clock_scale" min="0.8" max="3" step="0.1"></label>
+    <label><span>Position</span><select id="clock_vpos"><option value="top">Top</option><option value="bottom">Bottom</option></select></label>
+  </div>
+
+  <div class="group">
+    <h2>Typography</h2>
+    <label><span>Text font</span><input type="text" id="font_family" list="fontlist" placeholder="(theme font)"></label>
+    <label><span>Clock font</span><input type="text" id="clock_font" list="fontlist" placeholder="(same as text)"></label>
+    <label><span>Clock weight</span><select id="clock_weight">
+      <option value="regular">Regular</option>
+      <option value="medium">Medium</option>
+      <option value="semibold">Semibold</option>
+      <option value="bold">Bold</option>
+      <option value="black">Black</option>
+    </select></label>
+    <label><span>Clock letter spacing</span><input type="range" id="clock_spacing" min="-2" max="12" step="0.5"></label>
+    <div class="hint">Blank font = the Omarchy theme font. Clock font falls back to the text font, so one field styles everything. Names come from <code>fc-list</code>.</div>
+  </div>
+  <datalist id="fontlist">__FONT_OPTIONS__</datalist>
+
+  <div class="group">
+    <h2>User profile</h2>
+    <label><span>Enabled</span><input type="checkbox" id="profile_enabled"></label>
+    <label><span>Name</span><input type="text" id="profile_name"></label>
+    <div class="row"><label><span>Avatar path</span><input type="text" id="profile_avatar" placeholder="~/.face"></label><button class="ghost" id="profile_avatar_browse" type="button">Browse…</button></div>
+    <label><span>Show host</span><input type="checkbox" id="profile_show_host"></label>
+    <label><span>Hostname</span><input type="text" id="profile_host"></label>
+    <label><span>Welcome line</span><input type="checkbox" id="show_welcome"></label>
+    <label><span>Welcome text</span><input type="text" id="welcome_text" placeholder="Welcome back, {name}"></label>
+    <label><span>Position</span><select id="profile_pos">
+      <option value="bottom-left">Bottom-left</option><option value="top-left">Top-left</option>
+      <option value="bottom-right">Bottom-right</option><option value="top-right">Top-right</option>
+    </select></label>
+  </div>
+
+  <div class="group">
+    <h2>Text color</h2>
+    <label><span>Mode</span><select id="text_color_mode">
+      <option value="theme">Theme</option>
+      <option value="custom">Custom</option>
+      <option value="auto">Auto (from background)</option>
+    </select></label>
+    <label><span>Custom color</span><input type="text" id="text_color" placeholder="#ffffff"></label>
+    <div class="hint">Auto picks black or white from your background brightness so text is never invisible (white-on-white).</div>
+  </div>
+
+  <div class="group">
+    <h2>Dev quotes</h2>
+    <label><span>Enabled</span><input type="checkbox" id="quotes_enabled"></label>
+    <label><span>Larger text</span><input type="checkbox" id="quotes_big"></label>
+    <label><span>Rotate every (s)</span><input type="text" id="quote_interval" value="12"></label>
+    <label><span>Position</span><select id="quotes_pos">
+      <option value="bottom-center">Bottom</option><option value="top-center">Top</option>
+    </select></label>
+  </div>
+
+  <div class="group">
+    <h2>MPRIS media</h2>
+    <label><span>Enabled</span><input type="checkbox" id="media_enabled"></label>
+    <label><span>Position</span><select id="media_pos">
+      <option value="top-left">Top-left</option><option value="top-center">Top-center</option>
+      <option value="bottom-left">Bottom-left</option><option value="bottom-center">Bottom-center</option>
+    </select></label>
+  </div>
+
+  <div class="group">
+    <h2>Background</h2>
+    <div class="row"><label><span>Image path</span><input type="text" id="bg_image" placeholder="(theme default)"></label><button class="ghost" id="bg_browse" type="button">Browse…</button></div>
+    <label><span>Blur</span><input type="range" id="bg_blur" min="0" max="2" step="0.1"></label>
+    <label><span>Dim</span><input type="range" id="bg_dim" min="0" max="0.8" step="0.05"></label>
+  </div>
+
+  <div class="btns">
+    <button id="apply">Apply &amp; restart</button>
+    <button class="ghost" id="save">Save only</button>
+  </div>
+  <div class="btns" style="margin-top:8px">
+    <button class="ghost" id="backup">Backup now</button>
+    <button class="ghost" id="restore">Restore…</button>
+    <button class="danger" id="stock">Restore stock</button>
+  </div>
+  <div class="btns" style="margin-top:8px">
+    <button class="ghost" id="repo">Sync to project repo</button>
+  </div>
+  <div class="hint" id="repo-status">project repo: checking…</div>
+  <div class="hint">Every Apply backs up the previous LockView.qml. If the lock ever misbehaves, hit Restore (or Restore stock) then re-lock. Settings + backups live in ~/.config/omarchy/lockscreen-customizer/.</div>
+</div>
+
+<div id="stage">
+  <div id="screen">
+    <div class="bg" id="pv-bg"></div>
+    <div class="dim" id="pv-dim"></div>
+    <div class="w-clock" id="pv-clock"><div class="t" id="pv-time"></div><div class="d" id="pv-date"></div></div>
+    <div class="w-profile" id="pv-profile"><div class="av" id="pv-av"></div><div><div class="nm" id="pv-nm"></div><div class="ho" id="pv-ho"></div></div></div>
+    <div class="w-quote" id="pv-quote"><div id="pv-qt"></div><div class="a" id="pv-qa"></div></div>
+    <div class="w-media" id="pv-media"><div class="art" id="pv-art"></div><div><div class="ti" id="pv-ti"></div><div class="ar" id="pv-ar"></div></div></div>
+    <div class="pw">Enter Password</div>
+  </div>
+</div>
+<div class="modal" id="picker"><div class="modal-box">
+  <div class="modal-head"><span id="picker-path"></span><button class="ghost" id="picker-up" type="button">Up</button><button class="ghost" id="picker-cancel" type="button">Cancel</button></div>
+  <div class="modal-list" id="picker-list"></div>
+</div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let S = {};
+let THEME = {};
+const QUOTES = __QUOTES_JSON__;
+let qIdx = 0;
+
+const FIELDS = ["clock_enabled","clock_format","clock_show_seconds","clock_show_date","clock_date","clock_tz","clock_scale","clock_vpos","font_family","clock_font","clock_weight","clock_spacing",
+  "profile_enabled","profile_name","profile_avatar","profile_show_host","profile_host","profile_pos",
+  "quotes_enabled","quote_interval","quotes_pos","quotes_big","show_welcome","welcome_text","text_color_mode","text_color","media_enabled","media_pos","bg_image","bg_blur","bg_dim"];
+
+function setVal(k,v){ if (typeof v === "boolean") $(k).checked = v; else if ($(k).type === "range" || $(k).type === "text" || $(k).tagName === "SELECT") $(k).value = v; }
+function getVal(k){ const el = $(k); if (el.type === "checkbox") return el.checked; if (el.type === "range") return parseFloat(el.value); return el.value; }
+
+function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2200); }
+
+async function api(path, method="GET", body=null){
+  const opt = { method, headers: { "Content-Type": "application/json" } };
+  if (body) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  return await r.json().catch(()=>({ok:false}));
+}
+
+function applyTheme(){
+  document.documentElement.style.setProperty("--bg", THEME.background||"#101019");
+  document.documentElement.style.setProperty("--fg", THEME.foreground||"#cdd6f4");
+  document.documentElement.style.setProperty("--accent", THEME.accent||"#89b4fa");
+  document.documentElement.style.setProperty("--muted", THEME.muted||"#6c7086");
+}
+
+function pad(n){ return n<10?"0"+n:n; }
+function fmtTime(d, f, tz, showSec){
+  const sec = showSec || (f && f.indexOf("ss") >= 0);
+  try { return new Intl.DateTimeFormat(undefined, { hour:"2-digit", minute:"2-digit", second: sec ? "2-digit" : undefined, hour12: /AP/.test(f)||/a/.test(f), timeZone: tz||undefined }).format(d); }
+  catch(e){ return d.toTimeString().slice(0, sec ? 8 : 5); }
+}
+function fmtDate(d, f, tz){
+  try { return new Intl.DateTimeFormat(undefined, { weekday:"short", month:"short", day:"numeric", timeZone: tz||undefined }).format(d); }
+  catch(e){ return d.toDateString(); }
+}
+
+function renderPreview(){
+  const bg = $("pv-bg");
+  if (S.bg_image) { bg.style.backgroundImage = "url('file://"+S.bg_image+"')"; bg.style.filter = "blur("+(S.bg_blur*8)+"px)"; }
+  else { bg.style.backgroundImage = "none"; bg.style.filter = "blur(8px)"; }
+  $("pv-dim").style.opacity = (S.bg_dim===undefined?0.25:S.bg_dim);
+  const clock = $("pv-clock");
+  if (S.clock_enabled){ clock.style.display="block"; clock.style.top = S.clock_vpos==="top"?"48px":"auto"; clock.style.bottom = S.clock_vpos==="top"?"auto":"48px"; }
+  else clock.style.display="none";
+  $("pv-time").style.fontSize = (Style_h()*S.clock_scale)+"px";
+  $("pv-date").style.display = S.clock_show_date?"block":"none";
+  const baseFont = S.font_family || "";
+  const clockFont = S.clock_font || baseFont;
+  $("screen").style.fontFamily = baseFont;
+  $("pv-time").style.fontFamily = clockFont;
+  $("pv-date").style.fontFamily = clockFont;
+  $("pv-time").style.fontWeight = ({regular:"400",medium:"500",semibold:"600",bold:"700",black:"900"})[S.clock_weight||"bold"] || "700";
+  $("pv-time").style.letterSpacing = (S.clock_spacing||0)+"px";
+
+  const prof = $("pv-profile");
+  if (S.profile_enabled){ prof.style.display="flex"; placeCorner(prof, S.profile_pos); }
+  else prof.style.display="none";
+  $("pv-nm").textContent = (S.welcome_text || "Welcome back, {name}").replace("{name}", S.profile_name || "");
+  $("pv-nm").style.display = (S.profile_enabled && S.show_welcome) ? "block" : "none";
+  $("pv-ho").style.display = S.profile_show_host?"block":"none";
+  $("pv-ho").textContent = S.profile_host||"";
+  const av = $("pv-av");
+  if (S.profile_avatar){ av.innerHTML = '<img src="file://'+S.profile_avatar+'">'; }
+  else { av.textContent = (S.profile_name?S.profile_name[0].toUpperCase():"?"); }
+
+  const q = $("pv-quote");
+  if (S.quotes_enabled){ q.style.display="block"; q.style.top = S.quotes_pos==="top"?"48px":"auto"; q.style.bottom = S.quotes_pos==="top"?"auto":"48px"; }
+  else q.style.display="none";
+  $("pv-qt").style.fontSize = (S.quotes_big ? 30 : 20) + "px";
+  $("pv-qa").style.fontSize = (S.quotes_big ? 16 : 13) + "px";
+  applyLockText();
+}
+
+function withAlphaHex(hex, a){
+  hex = hex.replace('#','');
+  if (hex.length === 3) hex = hex.split('').map(c=>c+c).join('');
+  const r=parseInt(hex.substr(0,2),16), g=parseInt(hex.substr(2,2),16), b=parseInt(hex.substr(4,2),16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+function setTextColors(fg, muted){
+  document.documentElement.style.setProperty("--fg", fg);
+  document.documentElement.style.setProperty("--muted", muted);
+}
+function applyLockText(){
+  if (S.text_color_mode === "custom"){ const c = S.text_color || "#ffffff"; setTextColors(c, withAlphaHex(c, 0.6)); }
+  else if (S.text_color_mode === "auto"){ api("/api/auto-color","POST",S).then(r=>{ if (r.color) setTextColors(r.color, withAlphaHex(r.color, 0.6)); }); }
+  else { applyTheme(); }
+}
+
+function Style_h(){ return 26; } // base px for preview clock
+
+function placeCorner(el, pos){
+  const m="48px";
+  el.style.top = pos.includes("top")?m:"auto";
+  el.style.bottom = pos.includes("bottom")?m:"auto";
+  el.style.left = pos.includes("left")?m:"auto";
+  el.style.right = pos.includes("right")?m:"auto";
+}
+
+function tick(){
+  const d = new Date();
+  $("pv-time").textContent = fmtTime(d, S.clock_format, S.clock_tz, S.clock_show_seconds);
+  $("pv-date").textContent = fmtDate(d, S.clock_date, S.clock_tz);
+}
+function tickQuote(){
+  if (!QUOTES.length) return;
+  const q = QUOTES[qIdx % QUOTES.length]; qIdx++;
+  const sep = q.lastIndexOf(" — ");
+  if (sep>=0){ $("pv-qt").textContent = q.slice(0,sep); $("pv-qa").textContent = q.slice(sep+3); }
+  else { $("pv-qt").textContent = q; $("pv-qa").textContent=""; }
+}
+async function tickMedia(){
+  const m = await api("/api/media");
+  const box = $("pv-media");
+  if (S.media_enabled && m.title){ box.style.display="flex"; placeCorner(box, S.media_pos);
+    $("pv-ti").textContent = m.title; $("pv-ar").textContent = m.artist||"";
+    $("pv-art").style.backgroundImage = m.art?("url('"+m.art+"')"):"none";
+  } else box.style.display="none";
+}
+
+function collect(){ FIELDS.forEach(k=>S[k]=getVal(k)); }
+
+function bindLive(){ FIELDS.forEach(k=>{ const el=$(k); el.addEventListener("input",()=>{ collect(); renderPreview(); }); }); }
+
+let pickerTarget = null;
+let pickerCurParent = "";
+async function pickerLoad(path){
+  const d = await (await fetch("/api/files?path="+encodeURIComponent(path))).json();
+  pickerCurParent = d.parent;
+  $("picker-path").textContent = d.path;
+  const list = $("picker-list"); list.innerHTML = "";
+  if (d.parent) {
+    const up = document.createElement("div");
+    up.className = "pick row";
+    up.textContent = "⤴  .. (up)";
+    up.onclick = ()=>pickerLoad(d.parent);
+    list.appendChild(up);
+  }
+  d.entries.forEach(e=>{
+    const el = document.createElement("div");
+    el.className = "pick row" + (e.dir ? " dir" : " img");
+    el.textContent = (e.dir ? "▸ " : "🖼 ") + e.name;
+    el.onclick = async ()=>{
+      if (e.dir) { pickerLoad(d.path + "/" + e.name); return; }
+      const kind = (pickerTarget === "bg_image") ? "background" : "avatar";
+      let finalPath = d.path + "/" + e.name;
+      try {
+        const r = await api("/api/process-image", "POST", { path: finalPath, kind: kind });
+        if (r && r.path) finalPath = r.path;
+        if (r && r.upscaled) toast("Image upscaled for " + kind);
+      } catch (err) { /* fall back to original path */ }
+      $(pickerTarget).value = finalPath;
+      collect(); renderPreview(); closePicker();
+    };
+    list.appendChild(el);
+  });
+}
+function openPicker(t){ pickerTarget = t; $("picker").style.display = "flex"; pickerLoad(""); }
+function closePicker(){ $("picker").style.display = "none"; }
+
+async function restorePicker(){
+  const list = await api("/api/backups");
+  if (!list.length){ toast("No backups yet"); return; }
+  const pick = prompt("Restore which backup?\n"+list.map((b,i)=>i+": "+b.file).join("\n"), "0");
+  if (pick===null) return;
+  const b = list[parseInt(pick)];
+  if (!b) return;
+  const r = await api("/api/restore","POST",{file:b.file});
+  toast(r.ok?"Restored "+b.file:(r.error||"restore failed"));
+}
+
+async function refreshRepoStatus(){
+  const el = $("repo-status");
+  if (!el) return;
+  const r = await api("/api/repo-status");
+  if (!r.ok){ el.textContent = "project repo: " + (r.error || "unavailable"); return; }
+  const bits = [r.branch, r.dirty ? r.dirtyFiles + " uncommitted" : "clean", "last " + r.last];
+  if (r.ahead && r.ahead !== "0") bits.push(r.ahead + " ahead");
+  el.textContent = "repo: " + r.repo + " · " + bits.join(" · ");
+}
+
+async function init(){
+  const [theme, settings, media] = await Promise.all([api("/api/theme"), api("/api/settings"), api("/api/media")]);
+  THEME = theme; S = settings; applyTheme();
+  FIELDS.forEach(k=>setVal(k, S[k]));
+  renderPreview(); bindLive(); tick(); setInterval(tick,1000);
+  refreshRepoStatus();
+  setInterval(tickQuote, (S.quote_interval||12)*1000); tickQuote();
+  tickMedia(); setInterval(tickMedia,2000);
+
+  $("bg_browse").onclick = ()=>openPicker("bg_image");
+  $("profile_avatar_browse").onclick = ()=>openPicker("profile_avatar");
+  $("picker-cancel").onclick = closePicker;
+  $("picker-up").onclick = ()=>pickerLoad(pickerCurParent);
+  $("apply").onclick = async ()=>{ collect(); const r=await api("/api/apply","POST",S); toast(r.ok?"Applied & restarted shell":("Error: "+(r.error||""))); };
+  $("save").onclick = async ()=>{ collect(); const r=await api("/api/settings","POST",S); toast(r.ok?"Saved":"Save failed"); };
+  $("backup").onclick = async ()=>{ collect(); const r=await api("/api/apply","POST",S); toast(r.ok?"Backed up & applied":"Error"); };
+  $("restore").onclick = restorePicker;
+  $("repo").onclick = async ()=>{
+    toast("Syncing to project repo…");
+    const r = await api("/api/sync-repo","POST",{});
+    toast(r.ok ? (r.committed ? "Pushed " + r.commit : "Repo already up to date")
+               : ("Sync failed: " + (r.error||"unknown")));
+    refreshRepoStatus();
+  };
+  $("stock").onclick = async ()=>{ if(!confirm("Restore the untouched stock lock screen?")) return; const r=await api("/api/restore-stock","POST",{}); toast(r.ok?"Stock restored":("Error: "+(r.error||""))); };
+}
+init();
+</script>
+</body>
+</html>
+'''
+
+# ---------------------------------------------------------------------------
+# HTTP server
+# ---------------------------------------------------------------------------
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode()
+        elif isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        p = urllib.parse.urlparse(self.path).path
+        if p == "/" or p == "/index.html":
+            self._send(200, HTML.replace("__QUOTES_JSON__", json.dumps(QUOTES)).replace(
+                "__FONT_OPTIONS__",
+                "".join('<option value="%s">' % f.replace('"', "") for f in installed_fonts())), "text/html")
+        elif p == "/api/theme":
+            self._send(200, active_theme_colors())
+        elif p == "/api/settings":
+            self._send(200, load_settings())
+        elif p == "/api/media":
+            self._send(200, playerctl_snapshot())
+        elif p == "/api/backups":
+            self._send(200, list_backups())
+        elif p == "/api/repo-status":
+            self._send(200, repo_status())
+        elif p == "/api/files":
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self._send(200, list_files(q.get("path", [""])[0]))
+        else:
+            self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        p = urllib.parse.urlparse(self.path).path
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b""
+        try:
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            data = {}
+        plugin = find_plugin_dir()
+        lockview = os.path.join(plugin, "LockView.qml") if plugin else None
+
+        if p == "/api/settings":
+            save_settings(data)
+            self._send(200, {"ok": True})
+        elif p == "/api/sync-repo":
+            self._send(200, sync_repo())
+        elif p == "/api/apply":
+            save_settings(data)
+            if not lockview:
+                self._send(500, {"ok": False, "error": "lock plugin not found"})
+                return
+            ensure_face_glyph(plugin)
+            backup_current(lockview, label="pre-apply")
+            try:
+                with open(lockview, "w") as f:
+                    f.write(render_lockview(data))
+            except Exception as e:
+                self._send(500, {"ok": False, "error": str(e)})
+                return
+            ok, err = restart_shell()
+            self._send(200, {"ok": ok, "error": err})
+        elif p == "/api/restore":
+            if not lockview:
+                self._send(500, {"ok": False, "error": "lock plugin not found"})
+                return
+            ok, err = restore_backup(data.get("file", ""), lockview)
+            self._send(200, {"ok": ok, "error": err})
+        elif p == "/api/restore-stock":
+            if not lockview:
+                self._send(500, {"ok": False, "error": "lock plugin not found"})
+                return
+            if not os.path.isfile(INITIAL_BACKUP):
+                self._send(500, {"ok": False, "error": "no stock backup"})
+                return
+            import shutil
+            backup_current(lockview, label="pre-stock")
+            shutil.copy2(INITIAL_BACKUP, lockview)
+            ok, err = restart_shell()
+            self._send(200, {"ok": ok, "error": err})
+        elif p == "/api/process-image":
+            kind = data.get("kind", "background")
+            if kind not in ("background", "avatar"):
+                kind = "background"
+            self._send(200, process_image(data.get("path", ""), kind))
+        elif p == "/api/auto-color":
+            self._send(200, {"color": readable_text_color(effective_bg(data if data else load_settings()))})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def log_message(self, *a):
+        pass
+
+def main():
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    plugin = find_plugin_dir()
+    lockview = os.path.join(plugin, "LockView.qml") if plugin else None
+    ensure_initial_backup(lockview)
+    ensure_face_glyph(plugin)
+    if len(sys.argv) > 1 and sys.argv[1] == "--restore-stock":
+        if lockview and os.path.isfile(INITIAL_BACKUP):
+            import shutil
+            backup_current(lockview, label="pre-stock")
+            shutil.copy2(INITIAL_BACKUP, lockview)
+            ok, err = restart_shell()
+            print(("Restored stock. " + err) if ok else ("Failed: " + err))
+        else:
+            print("Cannot restore stock: plugin/backup not found.")
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--sync-repo":
+        r = sync_repo()
+        if r.get("ok"):
+            print(("Synced: " + r["commit"]) if r.get("committed") else "Dotfiles repo already up to date.")
+        else:
+            print("Sync failed: " + r.get("error", "unknown"))
+        return
+
+    no_open = "--no-open" in sys.argv
+    url = f"http://127.0.0.1:{PORT}/"
+    server = None
+    for attempt in range(6):
+        try:
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+            break
+        except OSError:
+            if attempt == 0:
+                print(f"Port {PORT} in use — taking over the existing instance…")
+            free_port(PORT)
+            time.sleep(0.5)
+    if server is None:
+        print(f"Could not bind {PORT}. Opening browser to any existing instance.")
+        if not no_open:
+            try:
+                subprocess.Popen(["firefox", url])
+            except Exception:
+                try:
+                    subprocess.Popen(["xdg-open", url])
+                except Exception:
+                    pass
+        return
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Omarchy Lock Studio running at {url}")
+    print("Press Ctrl+C to stop.")
+    if not no_open:
+        try:
+            subprocess.Popen(["firefox", url])
+        except Exception:
+            try:
+                subprocess.Popen(["xdg-open", url])
+            except Exception:
+                print("Could not auto-open firefox; open the URL manually.")
+    try:
+        while True:
+            server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping.")
+        server.shutdown()
+
+if __name__ == "__main__":
+    main()

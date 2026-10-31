@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Omarchy Lock Studio — live-preview lock screen customizer</title>
+<meta name="description" content="A local web app that customizes the Omarchy (Quickshell) lock screen: clock, typography, profile, dev quotes, MPRIS media and background, with a live preview and safe backups." />
+<meta property="og:title" content="Omarchy Lock Studio" />
+<meta property="og:description" content="Live-preview lock screen customizer for Omarchy: clock, typography, quotes, media, background — with backups that keep you able to unlock." />
+<meta property="og:type" content="website" />
+<meta property="og:image" content="screenshot.png" />
+<style>
+  :root { --bg:#0b0b10; --panel:#12121a; --fg:#cdd6f4; --muted:#6c7086; --accent:#89b4fa; --border:#26263a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 880px; margin: 0 auto; padding: 56px 22px 72px; }
+  h1 { font-size: clamp(30px, 5vw, 44px); margin: 0 0 8px; letter-spacing: -.02em; }
+  h1 span { color: var(--accent); }
+  p.lede { color: var(--muted); font-size: 18px; margin: 0 0 28px; }
+  img.shot { width:100%; height:auto; border-radius: 14px; border: 1px solid var(--border); display:block; margin: 0 0 32px; }
+  h2 { font-size: 19px; margin: 36px 0 12px; }
+  ul { padding-left: 22px; }
+  li { margin: 5px 0; }
+  code, pre { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 13.5px; }
+  code { background: var(--panel); border:1px solid var(--border); border-radius:5px; padding: 1px 5px; }
+  pre { background: var(--panel); border:1px solid var(--border); border-radius:10px; padding: 14px 16px; overflow-x:auto; }
+  pre code { background:none; border:0; padding:0; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin-top: 14px; }
+  .card { background: var(--panel); border:1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+  .card b { display:block; color: var(--accent); font-size: 13px; text-transform: uppercase; letter-spacing: .08em; margin-bottom: 6px; }
+  .card span { color: var(--muted); font-size: 14.5px; }
+  .btns { display:flex; gap:12px; flex-wrap:wrap; margin: 8px 0 4px; }
+  a.btn { display:inline-block; background: var(--accent); color:#0b0b10; text-decoration:none; font-weight:600; padding: 10px 16px; border-radius: 9px; }
+  a.btn.ghost { background: transparent; color: var(--fg); border:1px solid var(--border); }
+  footer { border-top:1px solid var(--border); margin-top:44px; padding-top:18px; color:var(--muted); font-size:14px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Omarchy <span>Lock Studio</span></h1>
+  <p class="lede">A local web app that customizes the Omarchy lock screen with a live preview — and never breaks your ability to unlock.</p>
+
+  <img class="shot" src="screenshot.png" alt="Omarchy Lock Studio web interface with a live lock screen preview" />
+
+  <div class="btns">
+    <a class="btn" href="https://github.com/Fiercejojo88862/omarchy-lock-studio">Source on GitHub</a>
+    <a class="btn ghost" href="https://github.com/basecamp/omarchy">What is Omarchy?</a>
+  </div>
+
+  <h2>Install</h2>
+  <pre><code>git clone https://github.com/Fiercejojo88862/omarchy-lock-studio.git
+cd omarchy-lock-studio
+./install.sh
+
+omarchy plugin clone omarchy.lock   # one time: the view it edits
+omarchy-lock-studio                 # opens 127.0.0.1:8731</code></pre>
+
+  <h2>What it does</h2>
+  <div class="grid">
+    <div class="card"><b>Clock</b><span>Format, seconds, date, timezone, size, top or bottom.</span></div>
+    <div class="card"><b>Typography</b><span>Text font, separate clock font, weight and letter spacing.</span></div>
+    <div class="card"><b>Profile</b><span>Name, avatar, hostname and an editable welcome line.</span></div>
+    <div class="card"><b>Dev quotes</b><span>Thirty quotes rotating at your interval, sized how you like.</span></div>
+    <div class="card"><b>Media</b><span>MPRIS now-playing title, artist and cover art.</span></div>
+    <div class="card"><b>Background</b><span>Image picker with upscaling, blur and dim.</span></div>
+    <div class="card"><b>Text color</b><span>Theme, custom hex, or auto-picked from the background.</span></div>
+    <div class="card"><b>Safety</b><span>Backup before every write, restore any backup or stock.</span></div>
+  </div>
+
+  <h2>How it stays safe</h2>
+  <ul>
+    <li>Edits only your own clone in <code>~/.config/omarchy/plugins/&lt;you&gt;.lock/</code>, never <code>/usr/share/omarchy</code>.</li>
+    <li>Keeps the password field and PAM authentication signals intact.</li>
+    <li>Writes a timestamped backup of <code>LockView.qml</code> before each change.</li>
+    <li>One lock plugin only: the Wayland session lock has a single owner, and the app tells you if another plugin is competing for it.</li>
+  </ul>
+
+  <footer>
+    Built by <a href="https://github.com/Fiercejojo88862">Joseph Michael Shaker</a> · MIT licensed · <a href="https://github.com/Fiercejojo88862/omarchy-lock-studio">github.com/Fiercejojo88862/omarchy-lock-studio</a>
+  </footer>
+</main>
+</body>
+</html>

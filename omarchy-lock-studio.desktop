@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Omarchy Lock Studio
+Comment=Customize the Omarchy lock screen — clock, profile, dev quotes, MPRIS, with live preview
+Exec=setsid -f omarchy-lock-studio
+Icon=preferences-desktop
+Terminal=false
+Type=Application
+Categories=Settings;DesktopSettings;
+Keywords=lock;screen;quickshell;customize;omarchy;theme;typography;

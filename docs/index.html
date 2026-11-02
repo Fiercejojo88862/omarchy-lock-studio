@@ -4,17 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Omarchy Lock Studio — live-preview lock screen customizer</title>
-<meta name="description" content="A local web app that customizes the Omarchy (Quickshell) lock screen: clock, typography, profile, dev quotes, MPRIS media and background, with a live preview and safe backups." />
+<link rel="icon" href="logo.svg" type="image/svg+xml" />
+<meta name="description" content="A local web app that customizes the Omarchy (Quickshell) lock screen: clock, typography, profile, dev quotes, MPRIS media, background, face unlock and fingerprint — with a live preview and safe backups." />
 <meta property="og:title" content="Omarchy Lock Studio" />
-<meta property="og:description" content="Live-preview lock screen customizer for Omarchy: clock, typography, quotes, media, background — with backups that keep you able to unlock." />
+<meta property="og:description" content="Live-preview lock screen customizer for Omarchy: clock, typography, quotes, media, background, face unlock and fingerprint — with backups that keep you able to unlock." />
 <meta property="og:type" content="website" />
-<meta property="og:image" content="screenshot.png" />
+<meta property="og:image" content="social-preview.png" />
 <style>
   :root { --bg:#0b0b10; --panel:#12121a; --fg:#cdd6f4; --muted:#6c7086; --accent:#89b4fa; --border:#26263a; }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; }
   main { max-width: 880px; margin: 0 auto; padding: 56px 22px 72px; }
   h1 { font-size: clamp(30px, 5vw, 44px); margin: 0 0 8px; letter-spacing: -.02em; }
+  .logo { margin: 0 0 14px; border-radius: 14px; }
   h1 span { color: var(--accent); }
   p.lede { color: var(--muted); font-size: 18px; margin: 0 0 28px; }
   img.shot { width:100%; height:auto; border-radius: 14px; border: 1px solid var(--border); display:block; margin: 0 0 32px; }
@@ -38,10 +40,11 @@
 </head>
 <body>
 <main>
+  <img class="logo" src="logo.svg" width="64" height="64" alt="" />
   <h1>Omarchy <span>Lock Studio</span></h1>
   <p class="lede">A local web app that customizes the Omarchy lock screen with a live preview — and never breaks your ability to unlock.</p>
 
-  <img class="shot" src="screenshot.png" alt="Omarchy Lock Studio web interface with a live lock screen preview" />
+  <img class="shot" src="social-preview.png" alt="Omarchy Lock Studio feature overview with a mock lock screen" />
 
   <div class="btns">
     <a class="btn" href="https://github.com/Fiercejojo88862/omarchy-lock-studio">Source on GitHub</a>
@@ -78,7 +81,8 @@ omarchy-lock-studio                 # opens 127.0.0.1:8731</code></pre>
   </ul>
 
   <footer>
-    Built by <a href="https://github.com/Fiercejojo88862">Joseph Michael Shaker</a> · MIT licensed · <a href="https://github.com/Fiercejojo88862/omarchy-lock-studio">github.com/Fiercejojo88862/omarchy-lock-studio</a>
+    Built by <a href="https://github.com/Fiercejojo88862">Joseph Michael Shaker</a> · MIT licensed · stands on <a href="https://github.com/basecamp/omarchy">Omarchy</a>, <a href="https://github.com/quickshell-mirror/quickshell">Quickshell</a> and <a href="https://github.com/L0adn9/omaface">omaFace</a> — <a href="https://github.com/Fiercejojo88862/omarchy-lock-studio/blob/main/CREDITS.md">full credits</a><br>
+    <a href="https://github.com/Fiercejojo88862/omarchy-lock-studio">github.com/Fiercejojo88862/omarchy-lock-studio</a>
   </footer>
 </main>
 </body>

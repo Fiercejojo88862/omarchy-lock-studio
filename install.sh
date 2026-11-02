@@ -6,13 +6,18 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bin="$HOME/.local/bin"
 apps="$HOME/.local/share/applications"
+icons="$HOME/.local/share/icons/hicolor/scalable/apps"
 
-mkdir -p "$bin" "$apps"
+mkdir -p "$bin" "$apps" "$icons"
 install -m 755 "$here/omarchy-lock-studio" "$bin/omarchy-lock-studio"
 install -m 644 "$here/omarchy-lock-studio.desktop" "$apps/omarchy-lock-studio.desktop"
+install -m 644 "$here/docs/logo.svg" "$icons/omarchy-lock-studio.svg"
+
+command -v python3 >/dev/null || { echo "error: python3 is required" >&2; exit 1; }
 
 echo "Installed: $bin/omarchy-lock-studio"
 echo "Launcher:  $apps/omarchy-lock-studio.desktop"
+echo "Icon:      $icons/omarchy-lock-studio.svg"
 
 if [[ ! -d "$HOME/.config/omarchy/plugins" ]]; then
   echo "warning: no ~/.config/omarchy/plugins — is this an Omarchy system?" >&2

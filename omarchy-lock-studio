@@ -2,8 +2,9 @@
 """
 omarchy-lock-studio — a safe, Omarchy-way lock screen customizer.
 
-* Clones the omarchy.lock plugin (already done -> josephs.lock) and edits the
-  user copy in ~/.config/omarchy/plugins/<user>.lock/ (never /usr/share/omarchy).
+* Clones the omarchy.lock plugin (omarchy plugin clone omarchy.lock) and edits
+  the user's own copy in ~/.config/omarchy/plugins/<you>.lock/ (never
+  /usr/share/omarchy).
 * Generates LockView.qml from a template, preserving the password field + PAM
   auth signals (so you can always unlock).
 * Serves a local web UI (opened in Firefox) with a real-time preview that
@@ -14,9 +15,10 @@ Controls:
   omarchy-lock-studio            start server + open browser
   omarchy-lock-studio --no-open  start server without opening a browser
   omarchy-lock-studio --restore-stock   restore the untouched cloned lock
-  omarchy-lock-studio --sync-repo       copy this app into its own project
-                                        repo (~/Work/omarchy-lock-studio),
-                                        commit and push. Also a web UI button.
+  omarchy-lock-studio --sync-repo       copy this app into a checkout of its
+                                        project repo and push it there. Needs
+                                        LOCKSTUDIO_REPO set to that checkout;
+                                        the web UI button appears only then.
 """
 
 import http.server
@@ -279,6 +281,18 @@ Item {
 """
 
 
+def default_display_name():
+    """The account's own name, so a fresh install greets its owner, not mine."""
+    try:
+        import pwd
+        entry = pwd.getpwuid(os.getuid())
+        full = (entry.pw_gecos or "").split(",")[0].strip()
+        if full:
+            return full
+    except Exception:
+        pass
+    return "Name"
+
 DEFAULT_SETTINGS = {
     "clock_enabled": True,
     "clock_format": "hh:mm AP",
@@ -293,7 +307,7 @@ DEFAULT_SETTINGS = {
     "clock_weight": "bold",
     "clock_spacing": 0,
     "profile_enabled": True,
-    "profile_name": "joseph",
+    "profile_name": default_display_name(),
     "profile_avatar": "",
     "profile_show_host": True,
     "profile_host": socket.gethostname(),
@@ -430,7 +444,12 @@ def restore_backup(filename, lockview_path):
 # Project repo sync (keeps this app published on GitHub)
 # ---------------------------------------------------------------------------
 
-STUDIO_REPO = os.environ.get("LOCKSTUDIO_REPO", os.path.expanduser("~/Work/omarchy-lock-studio"))
+_repo_env = os.environ.get("LOCKSTUDIO_REPO", "").strip()
+_default_repo = os.path.expanduser("~/Work/omarchy-lock-studio")
+# Only used when a checkout actually exists there, so the button is invisible on
+# a normal install instead of failing.
+STUDIO_REPO = _repo_env or (
+    _default_repo if os.path.isdir(os.path.join(_default_repo, ".git")) else "")
 STUDIO_SCRIPT_REL = "omarchy-lock-studio"
 
 
@@ -446,8 +465,10 @@ def git(repo, *args, timeout=30):
 
 def repo_status():
     repo = STUDIO_REPO
+    if not repo:
+        return {"ok": False, "configured": False}
     if not os.path.isdir(os.path.join(repo, ".git")):
-        return {"ok": False, "error": "no git repo at " + repo}
+        return {"ok": False, "configured": True, "error": "no git repo at " + repo}
     ok, branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
     if not ok:
         return {"ok": False, "error": branch}
@@ -469,6 +490,9 @@ def sync_repo():
     """Copy this app into its own project repo, commit and push."""
     import shutil
     repo = STUDIO_REPO
+    if not repo:
+        return {"ok": False, "configured": False,
+                "error": "set LOCKSTUDIO_REPO to a checkout of the project repo"}
     if not os.path.isdir(os.path.join(repo, ".git")):
         return {"ok": False, "error": "no git repo at " + repo}
 
@@ -1903,6 +1927,12 @@ async function refreshRepoStatus(){
   const el = $("repo-status");
   if (!el) return;
   const r = await api("/api/repo-status");
+  if (!r.ok && r.configured === false){
+    const btn = $("repo");
+    if (btn && btn.parentElement) btn.parentElement.style.display = "none";
+    el.style.display = "none";
+    return;
+  }
   if (!r.ok){ el.textContent = "project repo: " + (r.error || "unavailable"); return; }
   const bits = [r.branch, r.dirty ? r.dirtyFiles + " uncommitted" : "clean", "last " + r.last];
   if (r.ahead && r.ahead !== "0") bits.push(r.ahead + " ahead");

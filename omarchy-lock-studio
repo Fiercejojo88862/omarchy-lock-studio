@@ -1304,6 +1304,187 @@ def render_lockview(s):
     return out
 
 # ---------------------------------------------------------------------------
+# Authentication backends (fingerprint / face)
+# ---------------------------------------------------------------------------
+# Neither flow is invented here: Omarchy ships the fingerprint PAM setup and
+# omaFace ships the face engine. The studio only reports what the machine can
+# actually do and drives those tools, so a laptop with no reader says so
+# instead of offering a switch that cannot work.
+
+OMAFACE_BIN = "/usr/bin/omaface"
+OMAFACE_LOCK_PAM = "/etc/pam.d/omaface-lock"
+FINGERPRINT_LOCK_PAM = "/etc/pam.d/omarchy-lock-fingerprint"
+
+
+def run_cmd(cmd, timeout=8):
+    """Run a command, never raise: (returncode, combined output)."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+    except FileNotFoundError:
+        return 127, "not installed: " + cmd[0]
+    except Exception as e:
+        return 1, str(e)
+
+
+def video_camera_names():
+    """Names of the v4l2 capture devices, straight from sysfs."""
+    names = []
+    base = "/sys/class/video4linux"
+    try:
+        for d in sorted(os.listdir(base)):
+            try:
+                with open(os.path.join(base, d, "name")) as f:
+                    names.append(f.read().strip())
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return names
+
+
+def ir_camera_name():
+    for n in video_camera_names():
+        low = n.lower()
+        if "ir camera" in low or "infrared" in low:
+            return n
+    return ""
+
+
+def face_status():
+    camera = ir_camera_name()
+    installed = os.path.isfile(OMAFACE_BIN)
+    pam = os.path.isfile(OMAFACE_LOCK_PAM)
+    appearances = 0
+    lock_on = False
+    detail = ""
+    if installed:
+        rc, out = run_cmd([OMAFACE_BIN, "status"], timeout=6)
+        if rc == 0:
+            for line in out.splitlines():
+                s = line.strip()
+                m = re.match(r"^appearances\s+(\d+)", s)
+                if m:
+                    appearances = int(m.group(1))
+                elif re.match(r"^lock\s+(on|off)$", s):
+                    lock_on = s.endswith("on")
+        else:
+            detail = out.splitlines()[0] if out else ""
+    enrolled = appearances > 0
+    if not camera:
+        reason = "No IR camera on this machine."
+    elif not installed:
+        reason = "omaFace is not installed."
+    elif not pam:
+        reason = "Lock-screen PAM service missing — run omaface setup."
+    elif not enrolled:
+        reason = "No face enrolled yet."
+    elif not lock_on:
+        reason = "Face unlock is turned off for the lock screen."
+    else:
+        reason = "Ready — looks for your face when the lock screen wakes."
+    return {
+        "component": "face",
+        "camera": camera,
+        "hardware": bool(camera),
+        "installed": installed,
+        "pam": pam,
+        "appearances": appearances,
+        "enrolled": enrolled,
+        "lock_enabled": lock_on,
+        "available": bool(camera) and installed and pam and enrolled and lock_on,
+        "reason": reason,
+        "detail": detail,
+    }
+
+
+def fingerprint_status():
+    reader = run_cmd(["omarchy-hw-fingerprint"], timeout=5)[0] == 0
+    installed = any(os.path.exists(p) for p in (
+        "/usr/bin/fprintd-enroll", "/usr/bin/fprintd-list"))
+    pam = os.path.isfile(FINGERPRINT_LOCK_PAM)
+    prints = 0
+    if installed:
+        rc, out = run_cmd(["fprintd-list", os.environ.get("USER", "")], timeout=8)
+        if rc == 0 and "no prints" not in out.lower():
+            prints = len([l for l in out.splitlines() if l.strip().startswith("-")])
+    enrolled = prints > 0
+    if not reader:
+        reason = "No fingerprint reader detected on this machine."
+    elif not installed:
+        reason = "Reader found — fprintd is not installed yet."
+    elif not enrolled:
+        reason = "Reader found — no fingerprint enrolled yet."
+    elif not pam:
+        reason = "Fingerprints enrolled, but the lock screen PAM service is missing."
+    else:
+        reason = "Ready — the lock screen waits on the reader."
+    return {
+        "component": "fingerprint",
+        "hardware": reader,
+        "installed": installed,
+        "pam": pam,
+        "prints": prints,
+        "enrolled": enrolled,
+        "available": reader and installed and pam and enrolled,
+        "reason": reason,
+    }
+
+
+def auth_status():
+    return {"face": face_status(), "fingerprint": fingerprint_status()}
+
+
+def launch_terminal(command):
+    """Open an interactive command in a terminal window and return at once."""
+    try:
+        subprocess.Popen(
+            ["omarchy-launch-terminal", "bash", "-lc",
+             command + "; echo; read -r -p 'Press Enter to close…'"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def auth_action(component, action):
+    if component == "face":
+        if not os.path.isfile(OMAFACE_BIN):
+            return {"ok": False, "error": "omaFace is not installed"}
+        if action == "enroll":
+            ok, err = launch_terminal("omaface enroll")
+            return {"ok": ok, "error": err,
+                    "message": "Look at the camera and turn your head slowly."}
+        if action == "test":
+            ok, err = launch_terminal("omaface test")
+            return {"ok": ok, "error": err, "message": "Testing recognition…"}
+        if action in ("enable", "disable"):
+            rc, out = run_cmd([OMAFACE_BIN, action, "lock"], timeout=15)
+            return {"ok": rc == 0, "error": "" if rc == 0 else out,
+                    "message": "Face unlock %s for the lock screen." % (
+                        "on" if action == "enable" else "off")}
+        if action == "setup":
+            ok, err = launch_terminal("omaface setup")
+            return {"ok": ok, "error": err, "message": "omaFace setup window opened."}
+        return {"ok": False, "error": "unknown face action"}
+
+    if component == "fingerprint":
+        if not fingerprint_status()["hardware"]:
+            return {"ok": False,
+                    "error": "No fingerprint reader detected — nothing to set up."}
+        if action == "setup":
+            ok, err = launch_terminal("omarchy-setup-security-fingerprint")
+            return {"ok": ok, "error": err,
+                    "message": "Enrol a finger when asked, then test with sudo."}
+        if action == "enroll":
+            ok, err = launch_terminal('fprintd-enroll "$USER"')
+            return {"ok": ok, "error": err, "message": "Touch the reader."}
+        return {"ok": False, "error": "unknown fingerprint action"}
+
+    return {"ok": False, "error": "unknown component"}
+
+# ---------------------------------------------------------------------------
 # Web UI
 # ---------------------------------------------------------------------------
 
@@ -1377,6 +1558,15 @@ HTML = r'''<!DOCTYPE html>
   .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: #1e1e2e; border:1px solid var(--accent); color: var(--fg); padding: 8px 14px; border-radius: 8px; font-size: 12px; opacity: 0; transition: opacity .3s; }
   .toast.show { opacity: 1; }
   .hint { font-size: 10px; color: var(--muted); margin-top: 6px; line-height: 1.4; }
+  .auth-card { border: 1px solid #2e2e44; border-radius: 8px; padding: 10px; margin-bottom: 8px; }
+  .auth-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .auth-title { font-size: 12px; font-weight: 600; color: var(--fg); }
+  .badge { font-size: 9px; letter-spacing: .5px; text-transform: uppercase; padding: 2px 7px;
+    border-radius: 999px; border: 1px solid #2e2e44; color: var(--muted); white-space: nowrap; }
+  .badge.ok { color: #a6e3a1; border-color: #a6e3a1; }
+  .badge.warn { color: #f9e2af; border-color: #f9e2af; }
+  .badge.no { color: #f38ba8; border-color: #f38ba8; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
   .row { display: flex; align-items: center; gap: 8px; }
   .row label { flex: 1; }
   .modal { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: center; justify-content: center; z-index: 50; }
@@ -1472,6 +1662,32 @@ HTML = r'''<!DOCTYPE html>
     <div class="row"><label><span>Image path</span><input type="text" id="bg_image" placeholder="(theme default)"></label><button class="ghost" id="bg_browse" type="button">Browse…</button></div>
     <label><span>Blur</span><input type="range" id="bg_blur" min="0" max="2" step="0.1"></label>
     <label><span>Dim</span><input type="range" id="bg_dim" min="0" max="0.8" step="0.05"></label>
+  </div>
+
+  <div class="group">
+    <h2>Authentication</h2>
+
+    <div class="auth-card">
+      <div class="auth-head"><span class="auth-title">Face Recognition (omaFace)</span><span class="badge" id="face-badge">checking…</span></div>
+      <div class="hint" id="face-desc">—</div>
+      <div class="btns">
+        <button class="ghost" id="face-enroll" type="button">Enroll face</button>
+        <button class="ghost" id="face-test" type="button">Test</button>
+        <button class="ghost" id="face-toggle" type="button">Toggle on lock</button>
+        <button class="ghost" id="face-setup" type="button">Run setup</button>
+      </div>
+    </div>
+
+    <div class="auth-card">
+      <div class="auth-head"><span class="auth-title">Touch ID / Fingerprint</span><span class="badge" id="fp-badge">checking…</span></div>
+      <div class="hint" id="fp-desc">—</div>
+      <div class="btns">
+        <button class="ghost" id="fp-setup" type="button">Install &amp; configure</button>
+        <button class="ghost" id="fp-enroll" type="button">Enroll fingerprint</button>
+      </div>
+    </div>
+
+    <div class="hint">These only add a way in — the password field always keeps working. Status is read live from <code>omaface</code>, <code>omarchy-hw-fingerprint</code> and <code>fprintd</code>, so a machine without the hardware is told plainly rather than offered a switch that cannot work.</div>
   </div>
 
   <div class="btns">
@@ -1693,12 +1909,49 @@ async function refreshRepoStatus(){
   el.textContent = "repo: " + r.repo + " · " + bits.join(" · ");
 }
 
+async function refreshAuth(){
+  const a = await api("/api/auth");
+  const face = a.face || {}, fp = a.fingerprint || {};
+
+  const setBadge = (id, cls, text) => { const b = $(id); if (!b) return; b.className = "badge " + cls; b.textContent = text; };
+  const setDisabled = (id, on) => { const b = $(id); if (b) b.disabled = !!on; };
+
+  // Face
+  if (!face.hardware) setBadge("face-badge", "no", "no camera");
+  else if (!face.installed) setBadge("face-badge", "no", "not installed");
+  else if (face.available) setBadge("face-badge", "ok", "active");
+  else if (face.enrolled) setBadge("face-badge", "warn", "enrolled");
+  else setBadge("face-badge", "warn", "not enrolled");
+  $("face-desc").textContent = face.reason || "—";
+  setDisabled("face-enroll", !face.installed);
+  setDisabled("face-test", !(face.installed && face.enrolled));
+  setDisabled("face-toggle", !(face.installed && face.enrolled));
+  setDisabled("face-setup", !face.installed);
+  $("face-toggle").textContent = face.lock_enabled ? "Turn off on lock" : "Turn on for lock";
+
+  // Fingerprint
+  if (!fp.hardware) setBadge("fp-badge", "no", "no reader");
+  else if (fp.available) setBadge("fp-badge", "ok", "active");
+  else if (!fp.installed) setBadge("fp-badge", "warn", "not set up");
+  else setBadge("fp-badge", "warn", "no prints");
+  $("fp-desc").textContent = fp.reason || "—";
+  setDisabled("fp-setup", !fp.hardware);
+  setDisabled("fp-enroll", !(fp.hardware && fp.installed));
+}
+
+async function authAction(component, action){
+  const r = await api("/api/auth/action", "POST", { component, action });
+  toast(r.ok ? (r.message || "Done") : ("Failed: " + (r.error || "unknown")));
+  if (r.ok) setTimeout(refreshAuth, 1200);
+}
+
 async function init(){
   const [theme, settings, media] = await Promise.all([api("/api/theme"), api("/api/settings"), api("/api/media")]);
   THEME = theme; S = settings; applyTheme();
   FIELDS.forEach(k=>setVal(k, S[k]));
   renderPreview(); bindLive(); tick(); setInterval(tick,1000);
   refreshRepoStatus();
+  refreshAuth(); setInterval(refreshAuth, 15000);
   setInterval(tickQuote, (S.quote_interval||12)*1000); tickQuote();
   tickMedia(); setInterval(tickMedia,2000);
 
@@ -1718,6 +1971,17 @@ async function init(){
     refreshRepoStatus();
   };
   $("stock").onclick = async ()=>{ if(!confirm("Restore the untouched stock lock screen?")) return; const r=await api("/api/restore-stock","POST",{}); toast(r.ok?"Stock restored":("Error: "+(r.error||""))); };
+
+  $("face-enroll").onclick = ()=>authAction("face","enroll");
+  $("face-test").onclick = ()=>authAction("face","test");
+  $("face-setup").onclick = ()=>authAction("face","setup");
+  $("face-toggle").onclick = async ()=>{
+    const a = await api("/api/auth");
+    const on = !!(a.face && a.face.lock_enabled);
+    authAction("face", on ? "disable" : "enable");
+  };
+  $("fp-setup").onclick = ()=>authAction("fingerprint","setup");
+  $("fp-enroll").onclick = ()=>authAction("fingerprint","enroll");
 }
 init();
 </script>
@@ -1759,6 +2023,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, list_backups())
         elif p == "/api/repo-status":
             self._send(200, repo_status())
+        elif p == "/api/auth":
+            self._send(200, auth_status())
         elif p == "/api/files":
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             self._send(200, list_files(q.get("path", [""])[0]))
@@ -1821,6 +2087,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, process_image(data.get("path", ""), kind))
         elif p == "/api/auto-color":
             self._send(200, {"color": readable_text_color(effective_bg(data if data else load_settings()))})
+        elif p == "/api/auth/action":
+            self._send(200, auth_action(data.get("component", ""), data.get("action", "")))
         else:
             self._send(404, {"error": "not found"})
 

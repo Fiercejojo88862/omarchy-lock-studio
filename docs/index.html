@@ -65,15 +65,16 @@ omarchy-lock-studio                 # opens 127.0.0.1:8731</code></pre>
     <div class="card"><b>Media</b><span>MPRIS now-playing title, artist and cover art.</span></div>
     <div class="card"><b>Background</b><span>Image picker with upscaling, blur and dim.</span></div>
     <div class="card"><b>Text color</b><span>Theme, custom hex, or auto-picked from the background.</span></div>
+    <div class="card"><b>Authentication</b><span>Face unlock on the IR camera and fingerprint reader, with live hardware status, enroll, test and toggle.</span></div>
     <div class="card"><b>Safety</b><span>Backup before every write, restore any backup or stock.</span></div>
   </div>
 
   <h2>How it stays safe</h2>
   <ul>
     <li>Edits only your own clone in <code>~/.config/omarchy/plugins/&lt;you&gt;.lock/</code>, never <code>/usr/share/omarchy</code>.</li>
-    <li>Keeps the password field and PAM authentication signals intact.</li>
+    <li>Keeps the password field and PAM authentication signals intact. Biometrics — face on the IR camera, fingerprint via <code>fprintd</code> — only add a way in; the password stays the fallback.</li>
     <li>Writes a timestamped backup of <code>LockView.qml</code> before each change.</li>
-    <li>One lock plugin only: the Wayland session lock has a single owner, and the app tells you if another plugin is competing for it.</li>
+    <li>One lock plugin only: the Wayland session lock has a single owner. Running a second lock plugin silently wins the session, so disable it first (<code>omarchy plugin disable &lt;id&gt;</code>).</li>
   </ul>
 
   <footer>

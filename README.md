@@ -21,6 +21,7 @@ python3 + stdlib only      no build step      no root      never touches /usr/sh
 | **MPRIS media** | now-playing title/artist/art, four anchor positions |
 | **Background** | pick any image, automatic upscaling, blur, dim |
 | **Text color** | theme colors, custom hex, or auto-picked from the background brightness |
+| **Authentication** | live status for face unlock ([omaFace](https://github.com/L0adn9/omaface), IR camera) and fingerprint (fprintd) — enroll, test, and toggle each on the lock |
 | **Safety** | automatic backup before every write, restore any backup, restore stock |
 
 Fonts are suggested from `fc-list`, so anything installed on your system is available.
@@ -30,6 +31,7 @@ Fonts are suggested from `fc-list`, so anything installed on your system is avai
 - Omarchy (Quickshell shell) on Arch Linux
 - Python 3 (already present on Omarchy)
 - A cloned lock plugin to edit — see below
+- Optional: [omaFace](https://github.com/L0adn9/omaface) for face unlock and `fprintd` for a fingerprint reader. Neither is required; the Authentication panel reads the real hardware and says so when it is missing.
 
 ## Install
 
@@ -81,6 +83,7 @@ Settings and backups live in `~/.config/omarchy/lockscreen-customizer/`. Nothing
 - `Restore stock` writes back the untouched clone; `Restore…` lets you pick any backup.
 - If you edit the app while it is running, relaunch it before clicking Apply — a stale server can rewrite a broken `LockView.qml`.
 - An optional face-unlock indicator is part of the generated view. It stays hidden unless the service side supplies `faceState` / `faceAvailable` (see [omaFace](https://github.com/L0adn9/omaface)); the password always works regardless.
+- Biometrics only ever add a way in. Both flows authenticate through their own PAM services (`omaface-lock`, `omarchy-lock-fingerprint`), so the password field and `pam_unix` remain the fallback on every lock — the app never replaces them.
 
 ## Related
 

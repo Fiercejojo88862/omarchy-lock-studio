@@ -9,6 +9,7 @@ Change the clock, fonts, welcome line, quotes, now-playing art and background �
 watch it update instantly, and never lose the password field.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-89b4fa)](LICENSE)
+![Version 1.1.0](https://img.shields.io/badge/version-1.1.0-a6e3a1)
 ![Python 3 · stdlib only](https://img.shields.io/badge/python3-stdlib%20only-89b4fa)
 ![No root](https://img.shields.io/badge/root-not%20required-a6e3a1)
 
@@ -33,7 +34,7 @@ python3 + stdlib only   ·   no build step   ·   no root   ·   never touches /
 | **Clock** | on/off, time format (`hh:mm AP`, seconds), date format, timezone, size, top/bottom |
 | **Typography** | text font for the whole screen, separate clock font, clock weight (regular → black), clock letter spacing |
 | **Profile** | name, avatar, hostname, editable welcome line (`{name}` placeholder), any corner |
-| **Dev quotes** | 30 built-in quotes, rotation interval, size, top/bottom |
+| **Bottom text** | centred hourly NKJV verses, rotating developer quotes, or off; size and top/bottom placement |
 | **MPRIS media** | now-playing title/artist/art, four anchor positions |
 | **Background** | pick any image, automatic upscaling, blur, dim |
 | **Text color** | theme colors, custom hex, or auto-picked from the background brightness |
@@ -100,6 +101,7 @@ that cannot work.
 ```bash
 omarchy-lock-studio              # start the server and open the browser
 omarchy-lock-studio --no-open    # start the server only
+omarchy-lock-studio --version    # print the installed release
 omarchy-lock-studio --restore-stock
 ```
 

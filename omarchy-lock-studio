@@ -32,6 +32,7 @@ Controls:
 """
 
 import http.server
+import html
 import json
 import os
 import re
@@ -51,6 +52,22 @@ BACKUP_DIR = os.path.join(CONFIG_DIR, "backups")
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
 INITIAL_BACKUP = os.path.join(BACKUP_DIR, "initial-LockView.qml")
 PORT = 8731
+APP_VERSION = "1.1.0"
+
+QUOTES = [
+    "Talk is cheap. Show me the code. — Linus Torvalds",
+    "Simplicity is the soul of efficiency. — Austin Freeman",
+    "Make it work, make it right, make it fast. — Kent Beck",
+    "First, solve the problem. Then, write the code. — John Johnson",
+    "Code never lies, comments sometimes do. — Ron Jeffries",
+    "The only way to go fast is to go well. — Robert C. Martin",
+    "Deleted code is debugged code. — Jeff Sickel",
+    "Refactor early, refactor often. — Anonymous",
+    "The best error message is the one that never shows up. — Thomas Fuchs",
+    "Debugging is being the detective in a crime movie where you are also the murderer. — Filipe Fortes",
+    "The function of good software is to make the complex appear simple. — Grady Booch",
+    "Programs must be written for people to read. — Harold Abelson",
+]
 
 # Written into every generated view so a later run can tell its own output from
 # a stock/omaFace build that may overwrite it.
@@ -363,6 +380,8 @@ DEFAULT_SETTINGS = {
     "profile_host": socket.gethostname(),
     "profile_pos": "bottom-left",
     "verses_enabled": True,
+    "content_mode": "verse",
+    "quote_interval": 12,
     "verses_pos": "bottom-center",
     "verses_big": False,
     "show_welcome": True,
@@ -641,7 +660,12 @@ def load_settings():
                 if old in s:
                     merged[new] = s[old]
                     merged.pop(old, None)
-            merged.pop("quote_interval", None)
+            if "content_mode" not in s:
+                merged["content_mode"] = "verse" if merged.get("verses_enabled", True) else "off"
+            # Quote rotation returned in v1.1. Keep older saved intervals when
+            # present and otherwise use a calm, readable default.
+            if "quote_interval" in s:
+                merged["quote_interval"] = max(5, int(s.get("quote_interval") or 12))
             return merged
         except Exception:
             pass
@@ -1322,7 +1346,7 @@ Item {
           clip: true
           Image {
             anchors.fill: parent
-            source: (__PROFILE_AVATAR__ !== "") ? __PROFILE_AVATAR__ : ""
+            source: (__PROFILE_AVATAR__ !== "") ? root.fileUrl(__PROFILE_AVATAR__) : ""
             fillMode: Image.PreserveAspectCrop
             visible: __PROFILE_AVATAR__ !== ""
           }
@@ -1358,39 +1382,39 @@ Item {
       }
     }
 
-    // ===================== Bible verse (NKJV) =====================
-    // One verse per clock hour. The slot is the hour count since the epoch, so
-    // the verse turns over exactly on the hour, and the lock and the studio's
-    // preview always agree on which verse an hour carries.
+    // ===================== Bottom text =====================
+    // Bible verses turn over hourly; developer quotes use the chosen interval.
+    // The column itself remains geometrically centred even when the profile
+    // shares its band. Its width narrows to avoid overlap without a visual
+    // sideways nudge.
     Column {
       id: verseBox
-      visible: __VERSES_ENABLED__
+      visible: __CONTENT_MODE__ !== "off"
       width: __VERSE_WIDTH__
       anchors.horizontalCenter: parent.horizontalCenter
-      anchors.horizontalCenterOffset: __VERSE_OFFSET__
       anchors.top: (__VERSES_POS__.indexOf("top") >= 0) ? parent.top : undefined
       anchors.bottom: (__VERSES_POS__.indexOf("top") >= 0) ? undefined : parent.bottom
       anchors.topMargin: 56
       anchors.bottomMargin: 56
       property var verses: __VERSES_LIST__
-      function showVerse() {
-        if (!verses || verses.length === 0) return
-        var v = verses[Math.floor(Date.now() / 3600000) % verses.length]
+      property var quotes: __QUOTES_LIST__
+      function showContent() {
+        var bible = __CONTENT_MODE__ === "verse"
+        var items = bible ? verses : quotes
+        if (!items || items.length === 0) return
+        var slot = bible ? Math.floor(Date.now() / 3600000)
+                         : Math.floor(Date.now() / (__QUOTE_INTERVAL__ * 1000))
+        var v = items[slot % items.length]
         var sep = v.lastIndexOf(" — ")
         if (sep < 0) sep = v.lastIndexOf(" - ")
         if (sep >= 0) { verseText.text = v.substring(0, sep); verseRef.text = v.substring(sep + 3) }
         else { verseText.text = v; verseRef.text = "" }
       }
-      // Wait for the next hour boundary, then land on the hour every hour.
       Timer {
-        interval: 3600000 - (Date.now() % 3600000)
-        running: __VERSES_ENABLED__ && verseBox.verses.length > 0
-        repeat: false
-        onTriggered: {
-          verseBox.showVerse()
-          interval = 3600000
-          restart()
-        }
+        interval: 1000
+        running: verseBox.visible
+        repeat: true
+        onTriggered: verseBox.showContent()
       }
       Text {
         id: verseText
@@ -1413,7 +1437,7 @@ Item {
         font.pixelSize: Math.round(Style.font.heading * (__VERSES_BIG__ ? 0.85 : 0.6))
         text: ""
       }
-      Component.onCompleted: showVerse()
+      Component.onCompleted: showContent()
     }
 
     // ===================== MPRIS media =====================
@@ -1548,20 +1572,14 @@ def render_lockview(s):
     avatar = s.get("profile_avatar", "")
     if avatar:
         avatar = os.path.expanduser(avatar)
-    # The verse is centred and the profile sits in a bottom corner, so a wide
-    # verse runs straight through the name. When both share the bottom band,
-    # narrow the verse and nudge it away from the profile.
+    # The text remains centred. When the profile shares its band, narrow the
+    # text enough to avoid overlap without shifting its visual centre.
     quote_width = "Math.min(parent.width * 0.7, 900)"
-    quote_offset = "0"
     prof_pos = s.get("profile_pos", "bottom-left")
     verses_pos = s.get("verses_pos", "bottom-center")
-    if (s.get("profile_enabled") and s.get("verses_enabled")
+    if (s.get("profile_enabled") and s.get("content_mode", "verse") != "off"
             and prof_pos.split("-")[0] == verses_pos.split("-")[0]):
         quote_width = "Math.min(parent.width * 0.55, 820)"
-        if "left" in prof_pos and "center" in verses_pos:
-            quote_offset = "Math.round(parent.width * 0.07)"
-        elif "right" in prof_pos and "center" in verses_pos:
-            quote_offset = "-Math.round(parent.width * 0.07)"
     mode = s.get("text_color_mode", "theme")
     if mode == "theme":
         lock_text = "Color.lock.text"
@@ -1594,9 +1612,10 @@ def render_lockview(s):
         "__SHOW_WELCOME__": qbool(s["show_welcome"]),
         "__WELCOME_TEXT__": qstr(s["welcome_text"]),
         "__VERSES_ENABLED__": qbool(s["verses_enabled"]),
+        "__CONTENT_MODE__": qstr(s.get("content_mode", "verse")),
+        "__QUOTE_INTERVAL__": qnum(max(5, int(s.get("quote_interval", 12) or 12))),
         "__VERSES_POS__": qstr(s["verses_pos"]),
         "__VERSE_WIDTH__": quote_width,
-        "__VERSE_OFFSET__": quote_offset,
         "__VERSES_BIG__": qbool(s["verses_big"]),
         "__MEDIA_ENABLED__": qbool(s["media_enabled"]),
         "__MEDIA_POS__": qstr(s["media_pos"]),
@@ -1606,6 +1625,7 @@ def render_lockview(s):
         "__LOCK_TEXT_COLOR__": lock_text,
         "__LOCK_PLACEHOLDER_COLOR__": lock_ph,
         "__VERSES_LIST__": json.dumps(VERSES, ensure_ascii=False),
+        "__QUOTES_LIST__": json.dumps(QUOTES, ensure_ascii=False),
     }
     out = TEMPLATE
     for k, v in sub.items():
@@ -2353,7 +2373,7 @@ HTML = r'''<!DOCTYPE html>
 <body>
 <div id="panel">
   <h1>Omarchy Lock Studio</h1>
-  <div class="sub">Customize your Quickshell lock screen — safely.</div>
+  <div class="sub">Customize your Quickshell lock screen — safely. · v__APP_VERSION__</div>
 
   <div class="group">
     <h2>Clock</h2>
@@ -2369,8 +2389,8 @@ HTML = r'''<!DOCTYPE html>
 
   <div class="group">
     <h2>Typography</h2>
-    <label><span>Text font</span><input type="text" id="font_family" list="fontlist" placeholder="(theme font)"></label>
-    <label><span>Clock font</span><input type="text" id="clock_font" list="fontlist" placeholder="(same as text)"></label>
+    <label><span>Text font</span><select id="font_family"><option value="">Theme font</option>__FONT_OPTIONS__</select></label>
+    <label><span>Clock font</span><select id="clock_font"><option value="">Same as text</option>__FONT_OPTIONS__</select></label>
     <label><span>Clock weight</span><select id="clock_weight">
       <option value="regular">Regular</option>
       <option value="medium">Medium</option>
@@ -2381,8 +2401,6 @@ HTML = r'''<!DOCTYPE html>
     <label><span>Clock letter spacing</span><input type="range" id="clock_spacing" min="-2" max="12" step="0.5"></label>
     <div class="hint">Blank font = the Omarchy theme font. Clock font falls back to the text font, so one field styles everything. Names come from <code>fc-list</code>.</div>
   </div>
-  <datalist id="fontlist">__FONT_OPTIONS__</datalist>
-
   <div class="group">
     <h2>User profile</h2>
     <label><span>Enabled</span><input type="checkbox" id="profile_enabled"></label>
@@ -2410,13 +2428,18 @@ HTML = r'''<!DOCTYPE html>
   </div>
 
   <div class="group">
-    <h2>Bible verse (NKJV)</h2>
-    <label><span>Enabled</span><input type="checkbox" id="verses_enabled"></label>
+    <h2>Bottom text</h2>
+    <label><span>Content</span><select id="content_mode">
+      <option value="verse">Bible verse (NKJV)</option>
+      <option value="quote">Developer quote</option>
+      <option value="off">Off</option>
+    </select></label>
+    <label><span>Quote interval</span><input type="range" id="quote_interval" min="5" max="120" step="1"></label>
     <label><span>Larger text</span><input type="checkbox" id="verses_big"></label>
     <label><span>Placement</span><select id="verses_pos">
       <option value="bottom-center">Bottom</option><option value="top-center">Top</option>
     </select></label>
-    <div class="hint">One verse from the New King James Version, and it turns over on the hour — no timer to tune.</div>
+    <div class="hint">Verses turn over hourly. Developer quotes use the selected interval. Text stays precisely centred.</div>
   </div>
 
   <div class="group">
@@ -2510,10 +2533,11 @@ const $ = id => document.getElementById(id);
 let S = {};
 let THEME = {};
 const VERSES = __VERSES_JSON__;
+const QUOTES = __QUOTES_JSON__;
 
 const FIELDS = ["clock_enabled","clock_format","clock_show_seconds","clock_show_date","clock_date","clock_tz","clock_scale","clock_vpos","font_family","clock_font","clock_weight","clock_spacing",
   "profile_enabled","profile_name","profile_avatar","profile_show_host","profile_host","profile_pos",
-  "verses_enabled","verses_pos","verses_big","show_welcome","welcome_text","text_color_mode","text_color","media_enabled","media_pos","bg_image","bg_blur","bg_dim"];
+  "content_mode","quote_interval","verses_pos","verses_big","show_welcome","welcome_text","text_color_mode","text_color","media_enabled","media_pos","bg_image","bg_blur","bg_dim"];
 
 function setVal(k,v){ if (typeof v === "boolean") $(k).checked = v; else if ($(k).type === "range" || $(k).type === "text" || $(k).tagName === "SELECT") $(k).value = v; }
 function getVal(k){ const el = $(k); if (el.type === "checkbox") return el.checked; if (el.type === "range") return parseFloat(el.value); return el.value; }
@@ -2578,22 +2602,20 @@ function renderPreview(){
   else { av.textContent = (S.profile_name?S.profile_name[0].toUpperCase():"?"); }
 
   const q = $("pv-quote");
-  if (S.verses_enabled){
-    const atTop = S.verses_pos === "top";
+  if ((S.content_mode || "verse") !== "off"){
+    const atTop = String(S.verses_pos || "bottom-center").includes("top");
     const band = p => String(p || "bottom-center").split("-")[0];
-    // Same rule as the view: when the profile shares the verse's band, the
-    // verse narrows and steps aside instead of running through the name.
-    let width = Math.min(PREVIEW.width * 0.7, 900), offset = 0;
+    // Same rule as the view: narrow around the profile, but never shift away
+    // from the true horizontal centre.
+    let width = Math.min(PREVIEW.width * 0.7, 900);
     if (S.profile_enabled && band(S.profile_pos) === band(S.verses_pos)){
       width = Math.min(PREVIEW.width * 0.55, 820);
-      if (String(S.profile_pos).includes("left")) offset = Math.round(PREVIEW.width * 0.07);
-      else if (String(S.profile_pos).includes("right")) offset = -Math.round(PREVIEW.width * 0.07);
     }
     q.style.display = "block";
     q.style.top = atTop ? "56px" : "auto";
     q.style.bottom = atTop ? "auto" : "56px";
     q.style.width = Math.round(width) + "px";
-    q.style.transform = "translateX(calc(-50% + " + offset + "px))";
+    q.style.transform = "translateX(-50%)";
     $("pv-qt").style.fontSize = Math.round(Style_h()*(S.verses_big?1.15:0.8)) + "px";
     $("pv-qa").style.fontSize = Math.round(Style_h()*(S.verses_big?0.85:0.6)) + "px";
   } else q.style.display="none";
@@ -2657,23 +2679,24 @@ function tick(){
   $("pv-time").textContent = fmtTime(d, S.clock_format, S.clock_tz, S.clock_show_seconds);
   $("pv-date").textContent = fmtDate(d, S.clock_date, S.clock_tz);
 }
-// The lock view picks the verse whose slot is the hour count since the epoch,
-// so the preview uses the same arithmetic and the two never disagree.
-function verseForNow(){
-  if (!VERSES.length) return null;
-  return VERSES[Math.floor(Date.now() / 3600000) % VERSES.length];
+// Use the same time-slot arithmetic as the generated QML.
+function contentForNow(){
+  const bible = (S.content_mode || "verse") === "verse";
+  const items = bible ? VERSES : QUOTES;
+  if (!items.length || (S.content_mode || "verse") === "off") return null;
+  const span = bible ? 3600000 : Math.max(5, Number(S.quote_interval || 12)) * 1000;
+  return items[Math.floor(Date.now() / span) % items.length];
 }
-function tickVerse(){
-  const q = verseForNow();
+function tickContent(){
+  const q = contentForNow();
   if (!q) return;
   const sep = q.lastIndexOf(" — ");
   if (sep>=0){ $("pv-qt").textContent = q.slice(0,sep); $("pv-qa").textContent = q.slice(sep+3); }
   else { $("pv-qt").textContent = q; $("pv-qa").textContent=""; }
 }
-// Re-arm for the next hour boundary rather than polling.
-function verseClock(){
-  tickVerse();
-  setTimeout(verseClock, 3600000 - (Date.now() % 3600000) + 250);
+function contentClock(){
+  tickContent();
+  setTimeout(contentClock, 1000);
 }
 async function tickMedia(){
   const m = await api("/api/media");
@@ -2813,7 +2836,7 @@ async function init(){
   renderPreview(); bindLive(); tick(); setInterval(tick,1000);
   refreshRepoStatus();
   refreshAuth(); setInterval(refreshAuth, 15000);
-  verseClock();
+  contentClock();
   tickMedia(); setInterval(tickMedia,2000);
 
   $("bg_browse").onclick = ()=>openPicker("bg_image");
@@ -2911,9 +2934,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         p = urllib.parse.urlparse(self.path).path
         if p == "/" or p == "/index.html":
-            self._send(200, HTML.replace("__VERSES_JSON__", json.dumps(VERSES, ensure_ascii=False)).replace(
-                "__FONT_OPTIONS__",
-                "".join('<option value="%s">' % f.replace('"', "") for f in installed_fonts())), "text/html")
+            font_options = "".join(
+                '<option value="%s">%s</option>' % (html.escape(f, quote=True), html.escape(f))
+                for f in installed_fonts())
+            page = (HTML.replace("__VERSES_JSON__", json.dumps(VERSES, ensure_ascii=False))
+                    .replace("__QUOTES_JSON__", json.dumps(QUOTES, ensure_ascii=False))
+                    .replace("__FONT_OPTIONS__", font_options)
+                    .replace("__APP_VERSION__", APP_VERSION))
+            self._send(200, page, "text/html")
         elif p == "/api/theme":
             self._send(200, active_theme_colors())
         elif p == "/api/preview":
@@ -3113,6 +3141,9 @@ def main():
     ensure_face_glyph(plugin)
 
     args = sys.argv[1:]
+    if "--version" in args:
+        print("Omarchy Lock Studio " + APP_VERSION)
+        return
     if "--restore-stock" in args:
         target, _conflicts, _available = resolve_lock_target()
         if not target:

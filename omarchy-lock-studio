@@ -2,19 +2,29 @@
 """
 omarchy-lock-studio — a safe, Omarchy-way lock screen customizer.
 
-* Clones the omarchy.lock plugin (omarchy plugin clone omarchy.lock) and edits
-  the user's own copy in ~/.config/omarchy/plugins/<you>.lock/ (never
-  /usr/share/omarchy).
+* Writes into whichever lock-screen service the shell actually runs — the
+  enabled clone of omarchy.lock (omaFace, or a plain <you>.lock clone) — never
+  /usr/share/omarchy, and never into a plugin the shell has disabled.
 * Generates LockView.qml from a template, preserving the password field + PAM
-  auth signals (so you can always unlock).
-* Serves a local web UI (opened in Firefox) with a real-time preview that
-  uses your active Omarchy theme colors.
+  auth signals (so you can always unlock), and reads the host Service.qml so a
+  property added by an Omarchy/omaFace update is carried instead of breaking the
+  view. A post-update hook re-applies it, so big updates no longer break it.
+* Serves a local UI in its own desktop window (WebKitGTK; Firefox is the
+  fallback) with a real-time preview that uses your active Omarchy theme colors.
+* Shows one New King James verse per clock hour on the lock screen; the verse
+  turns over on the hour and needs no network.
 * Backs up LockView.qml before every change; supports restore + restore-stock.
 
 Controls:
-  omarchy-lock-studio            start server + open browser
-  omarchy-lock-studio --no-open  start server without opening a browser
+  omarchy-lock-studio            start server + open the app window
+  omarchy-lock-studio --app      force the app window
+  omarchy-lock-studio --browser  force a browser tab instead
+  omarchy-lock-studio --no-open  start server without opening anything
   omarchy-lock-studio --restore-stock   restore the untouched cloned lock
+  omarchy-lock-studio --sync            re-apply the saved settings to the
+                                        active lock plugin (used by the
+                                        post-update hook); add --restart to
+                                        reload the shell afterwards
   omarchy-lock-studio --sync-repo       copy this app into a checkout of its
                                         project repo and push it there. Needs
                                         LOCKSTUDIO_REPO set to that checkout;
@@ -28,11 +38,13 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import datetime
 import hashlib
 import time
 import urllib.parse
+import urllib.request
 
 CONFIG_DIR = os.path.expanduser("~/.config/omarchy/lockscreen-customizer")
 BACKUP_DIR = os.path.join(CONFIG_DIR, "backups")
@@ -40,37 +52,75 @@ SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
 INITIAL_BACKUP = os.path.join(BACKUP_DIR, "initial-LockView.qml")
 PORT = 8731
 
-QUOTES = [
-    "Talk is cheap. Show me the code. — Linus Torvalds",
-    "Programs must be written for people to read, and only incidentally for machines to execute. — Harold Abelson",
-    "Any fool can write code that a computer can understand. Good programmers write code that humans can understand. — Martin Fowler",
-    "First, solve the problem. Then, write the code. — John Johnson",
-    "Simplicity is the soul of efficiency. — Austin Freeman",
-    "Make it work, make it right, make it fast. — Kent Beck",
-    "The best error message is the one that never shows up. — Thomas Fuchs",
-    "Code is like humor. When you have to explain it, it's bad. — Cory House",
-    "Before software can be reusable it first has to be usable. — Ralph Johnson",
-    "Walking on water and developing software from a specification are easy if both are frozen. — Edward Berard",
-    "Premature optimization is the root of all evil. — Donald Knuth",
-    "There are two ways to write error-free programs; only the third one works. — Alan Perlis",
-    "Code never lies, comments sometimes do. — Ron Jeffries",
-    "Don't comment bad code — rewrite it. — Brian Kernighan",
-    "The function of good software is to make the complex appear simple. — Grady Booch",
-    "Programming isn't about what you know; it's about what you can figure out. — Chris Pine",
-    "The most damaging phrase in the language is 'We've always done it this way.' — Grace Hopper",
-    "A language that doesn't affect the way you think about programming is not worth knowing. — Alan Perlis",
-    "Deleted code is debugged code. — Jeff Sickel",
-    "If it doesn't work, it doesn't matter how fast it doesn't work. — Mich Ravera",
-    "Without requirements or design, programming is the art of adding bugs to an empty text file. — Louis Srygley",
-    "The only way to go fast is to go well. — Robert C. Martin",
-    "Don't let the perfect be the enemy of the good. — Voltaire",
-    "Software and cathedrals are much the same — first we build them, then we pray. — Sam Redwine",
-    "Debugging is like being a detective in a crime movie where you are also the murderer. — Filipe Fortes",
-    "If you can't explain it simply, you don't understand it well enough. — Albert Einstein",
-    "Refactor early, refactor often. — Anonymous",
-    "The glass is neither half full nor half empty; the container is twice as large as it needs to be. — Anonymous",
-    "A distributed system is one where a machine I've never heard of can make mine stop working. — Leslie Lamport",
-    "It works on my machine. — Every developer, ever",
+# Written into every generated view so a later run can tell its own output from
+# a stock/omaFace build that may overwrite it.
+GENERATED_MARKER = "generated by omarchy-lock-studio"
+# Lock providers that carry an extra authentication flow (the camera) into the
+# view; when one is enabled it owns the lock and gets the customization.
+FACE_PROVIDERS = ("io.github.l0adn9.omaface",)
+
+# One verse per clock hour, shown instead of dev quotes. New King James
+# Version; the text is brief quotation (NKJV (c) 1982 Thomas Nelson) kept in
+# this file so the lock screen needs no network. Edit or extend the list freely
+# - the view picks the entry for the current hour, so the count is arbitrary.
+# Format: "<verse text> \u2014 <reference> (NKJV)"; the view splits on the dash
+# so the reference shows on its own line.
+VERSES = [
+    "The LORD is my shepherd; I shall not want. — Psalm 23:1 (NKJV)",
+    "God is our refuge and strength, A very present help in trouble. — Psalm 46:1 (NKJV)",
+    "This is the day the LORD has made; We will rejoice and be glad in it. — Psalm 118:24 (NKJV)",
+    "Your word is a lamp to my feet And a light to my path. — Psalm 119:105 (NKJV)",
+    "The LORD is my light and my salvation; Whom shall I fear? The LORD is the strength of my life; Of whom shall I be afraid? — Psalm 27:1 (NKJV)",
+    "Delight yourself also in the LORD, And He shall give you the desires of your heart. — Psalm 37:4 (NKJV)",
+    "Cast your burden on the LORD, And He shall sustain you; He shall never permit the righteous to be moved. — Psalm 55:22 (NKJV)",
+    "For His anger is but for a moment, His favor is for life; Weeping may endure for a night, But joy comes in the morning. — Psalm 30:5 (NKJV)",
+    "Oh, taste and see that the LORD is good; Blessed is the man who trusts in Him! — Psalm 34:8 (NKJV)",
+    "He who dwells in the secret place of the Most High Shall abide under the shadow of the Almighty. — Psalm 91:1 (NKJV)",
+    "I will lift up my eyes to the hills— From whence comes my help? My help comes from the LORD, Who made heaven and earth. — Psalm 121:1-2 (NKJV)",
+    "Cause me to hear Your lovingkindness in the morning, For in You do I trust; Cause me to know the way in which I should walk, For I lift up my soul to You. — Psalm 143:8 (NKJV)",
+    "You will show me the path of life; In Your presence is fullness of joy; At Your right hand are pleasures forevermore. — Psalm 16:11 (NKJV)",
+    "My flesh and my heart fail; But God is the strength of my heart and my portion forever. — Psalm 73:26 (NKJV)",
+    "Trust in the LORD with all your heart, And lean not on your own understanding; In all your ways acknowledge Him, And He shall direct your paths. — Proverbs 3:5-6 (NKJV)",
+    "Commit your works to the LORD, And your thoughts will be established. — Proverbs 16:3 (NKJV)",
+    "The name of the LORD is a strong tower; The righteous run to it and are safe. — Proverbs 18:10 (NKJV)",
+    "But those who wait on the LORD Shall renew their strength; They shall mount up with wings like eagles, They shall run and not be weary, They shall walk and not faint. — Isaiah 40:31 (NKJV)",
+    "Fear not, for I am with you; Be not dismayed, for I am your God. I will strengthen you, Yes, I will help you, I will uphold you with My righteous right hand. — Isaiah 41:10 (NKJV)",
+    "For I know the thoughts that I think toward you, says the LORD, thoughts of peace and not of evil, to give you a future and a hope. — Jeremiah 29:11 (NKJV)",
+    "Through the LORD’s mercies we are not consumed, Because His compassions fail not. They are new every morning; Great is Your faithfulness. — Lamentations 3:22-23 (NKJV)",
+    "Have I not commanded you? Be strong and of good courage; do not be afraid, nor be dismayed, for the LORD your God is with you wherever you go. — Joshua 1:9 (NKJV)",
+    "Be strong and of good courage, do not fear nor be afraid of them; for the LORD your God, He is the One who goes with you. He will not leave you nor forsake you. — Deuteronomy 31:6 (NKJV)",
+    "He has shown you, O man, what is good; And what does the LORD require of you But to do justly, To love mercy, And to walk humbly with your God? — Micah 6:8 (NKJV)",
+    "The LORD is good, A stronghold in the day of trouble; And He knows those who trust in Him. — Nahum 1:7 (NKJV)",
+    "The LORD your God in your midst, The Mighty One, will save; He will rejoice over you with gladness, He will quiet you with His love, He will rejoice over you with singing. — Zephaniah 3:17 (NKJV)",
+    "To everything there is a season, A time for every purpose under heaven. — Ecclesiastes 3:1 (NKJV)",
+    "Let your light so shine before men, that they may see your good works and glorify your Father in heaven. — Matthew 5:16 (NKJV)",
+    "But seek first the kingdom of God and His righteousness, and all these things shall be added to you. — Matthew 6:33 (NKJV)",
+    "Come to Me, all you who labor and are heavy laden, and I will give you rest. — Matthew 11:28 (NKJV)",
+    "For God so loved the world that He gave His only begotten Son, that whoever believes in Him should not perish but have everlasting life. — John 3:16 (NKJV)",
+    "Then Jesus spoke to them again, saying, I am the light of the world. He who follows Me shall not walk in darkness, but have the light of life. — John 8:12 (NKJV)",
+    "Jesus said to him, I am the way, the truth, and the life. No one comes to the Father except through Me. — John 14:6 (NKJV)",
+    "Peace I leave with you, My peace I give to you; not as the world gives do I give to you. Let not your heart be troubled, neither let it be afraid. — John 14:27 (NKJV)",
+    "The thief does not come except to steal, and to kill, and to destroy. I have come that they may have life, and that they may have it more abundantly. — John 10:10 (NKJV)",
+    "And we know that all things work together for good to those who love God, to those who are the called according to His purpose. — Romans 8:28 (NKJV)",
+    "And do not be conformed to this world, but be transformed by the renewing of your mind, that you may prove what is that good and acceptable and perfect will of God. — Romans 12:2 (NKJV)",
+    "Love suffers long and is kind; love does not envy; love does not parade itself, is not puffed up. — 1 Corinthians 13:4 (NKJV)",
+    "Therefore, if anyone is in Christ, he is a new creation; old things have passed away; behold, all things have become new. — 2 Corinthians 5:17 (NKJV)",
+    "And He said to me, My grace is sufficient for you, for My strength is made perfect in weakness. Therefore most gladly I will rather boast in my infirmities, that the power of Christ may rest upon me. — 2 Corinthians 12:9 (NKJV)",
+    "But the fruit of the Spirit is love, joy, peace, longsuffering, kindness, goodness, faithfulness, gentleness, self-control. Against such there is no law. — Galatians 5:22-23 (NKJV)",
+    "For by grace you have been saved through faith, and that not of yourselves; it is the gift of God. — Ephesians 2:8 (NKJV)",
+    "Be anxious for nothing, but in everything by prayer and supplication, with thanksgiving, let your requests be made known to God; and the peace of God, which surpasses all understanding, will guard your hearts and minds through Christ Jesus. — Philippians 4:6-7 (NKJV)",
+    "I can do all things through Christ who strengthens me. — Philippians 4:13 (NKJV)",
+    "And my God shall supply all your need according to His riches in glory by Christ Jesus. — Philippians 4:19 (NKJV)",
+    "And whatever you do, do it heartily, as to the Lord and not to men. — Colossians 3:23 (NKJV)",
+    "Rejoice always, pray without ceasing, in everything give thanks; for this is the will of God in Christ Jesus for you. — 1 Thessalonians 5:16-18 (NKJV)",
+    "For God has not given us a spirit of fear, but of power and of love and of a sound mind. — 2 Timothy 1:7 (NKJV)",
+    "Now faith is the substance of things hoped for, the evidence of things not seen. — Hebrews 11:1 (NKJV)",
+    "Jesus Christ is the same yesterday, today, and forever. — Hebrews 13:8 (NKJV)",
+    "If any of you lacks wisdom, let him ask of God, who gives to all liberally and without reproach, and it will be given to him. — James 1:5 (NKJV)",
+    "Casting all your care upon Him, for He cares for you. — 1 Peter 5:7 (NKJV)",
+    "If we confess our sins, He is faithful and just to forgive us our sins and to cleanse us from all unrighteousness. — 1 John 1:9 (NKJV)",
+    "We love Him because He first loved us. — 1 John 4:19 (NKJV)",
+    "And God will wipe away every tear from their eyes; there shall be no more death, nor sorrow, nor crying. There shall be no more pain, for the former things have passed away. — Revelation 21:4 (NKJV)",
 ]
 
 # The optional face-unlock mark (omaFace's FaceGlyph), shipped inline so a
@@ -312,10 +362,9 @@ DEFAULT_SETTINGS = {
     "profile_show_host": True,
     "profile_host": socket.gethostname(),
     "profile_pos": "bottom-left",
-    "quotes_enabled": True,
-    "quote_interval": 12,
-    "quotes_pos": "bottom-center",
-    "quotes_big": False,
+    "verses_enabled": True,
+    "verses_pos": "bottom-center",
+    "verses_big": False,
     "show_welcome": True,
     "welcome_text": "Welcome back, {name}",
     "text_color_mode": "theme",
@@ -341,11 +390,22 @@ CLOCK_WEIGHTS = {
 # ---------------------------------------------------------------------------
 
 def find_plugin_dir():
-    """Locate the user-cloned omarchy.lock plugin (~/.config/omarchy/plugins/*)."""
+    """Directory of the enabled lock provider, or None.
+
+    Kept as the single lookup the rest of the app uses, so every write lands in
+    the plugin the shell actually loads instead of the first clone on disk.
+    """
+    target, _conflicts, _available = resolve_lock_target()
+    return target["dir"] if target else None
+
+
+def local_plugins():
+    """id -> {id, dir, manifest} for every plugin in the user's plugins folder."""
     base = os.path.expanduser("~/.config/omarchy/plugins")
+    out = {}
     if not os.path.isdir(base):
-        return None
-    for name in os.listdir(base):
+        return out
+    for name in sorted(os.listdir(base)):
         mpath = os.path.join(base, name, "manifest.json")
         if not os.path.isfile(mpath):
             continue
@@ -353,14 +413,178 @@ def find_plugin_dir():
             m = json.load(open(mpath))
         except Exception:
             continue
-        if m.get("omarchy", {}).get("clonedFrom") == "omarchy.lock" or m.get("id", "").endswith(".lock"):
-            return os.path.join(base, name)
-    return None
+        pid = m.get("id") or name
+        out[pid] = {"id": pid, "dir": os.path.join(base, name), "manifest": m}
+    return out
 
-def ensure_initial_backup(lockview_path):
+
+_PLUGIN_STATE_CACHE = {"at": 0.0, "map": None}
+
+
+def plugin_enabled_map(max_age=10):
+    """id -> enabled, straight from the shell's own plugin registry.
+
+    None when the command is missing, so callers can fall back instead of
+    guessing and writing into a plugin the shell never loads. Cached briefly:
+    the UI polls authentication status and every poll would otherwise spawn the
+    CLI again.
+    """
+    now = time.time()
+    if (_PLUGIN_STATE_CACHE["map"] is not None
+            and now - _PLUGIN_STATE_CACHE["at"] < max_age):
+        return _PLUGIN_STATE_CACHE["map"]
+    try:
+        p = subprocess.run(["omarchy", "plugin", "list", "--json"],
+                           capture_output=True, text=True, timeout=15)
+        if p.returncode != 0:
+            return None
+        data = json.loads(p.stdout or "[]")
+    except Exception:
+        return None
+    states = {}
+    for row in data if isinstance(data, list) else []:
+        if isinstance(row, dict) and row.get("id"):
+            states[row["id"]] = bool(row.get("enabled"))
+    _PLUGIN_STATE_CACHE.update({"at": now, "map": states})
+    return states
+
+
+def lock_targets():
+    """Every lock-screen provider found locally, tagged with enable state.
+
+    A provider is a service plugin that locks the session. That is normally a
+    clone of omarchy.lock (omaFace included), but it is also recognised by an
+    authentication capability or by talking to WlSessionLock, so a future
+    rename of Omarchy's lock plugin does not make this app lose its target.
+    Only the user's plugins folder is scanned: that is the one place this app is
+    allowed to write.
+    """
+    states = plugin_enabled_map()
+    out = []
+    for pid, info in local_plugins().items():
+        m = info["manifest"]
+        if "service" not in (m.get("kinds") or []):
+            continue
+        entry = (m.get("entryPoints") or {}).get("service", "")
+        service_path = os.path.join(info["dir"], entry) if entry else ""
+        omarchy_meta = m.get("omarchy") or {}
+        cloned = omarchy_meta.get("clonedFrom", "") or ""
+        caps = omarchy_meta.get("capabilities") or []
+        lockish = (cloned == "omarchy.lock" or pid == "omarchy.lock"
+                   or pid.endswith(".lock") or "authentication" in caps)
+        if not lockish and service_path:
+            try:
+                with open(service_path) as f:
+                    lockish = "WlSessionLock" in f.read()
+            except Exception:
+                lockish = False
+        if not lockish:
+            continue
+        out.append({
+            "id": pid,
+            "dir": info["dir"],
+            "has_service": bool(entry) and os.path.isfile(service_path),
+            "face": pid in FACE_PROVIDERS,
+            "enabled": states.get(pid, False) if states is not None else True,
+        })
+    return out
+
+
+def resolve_lock_target():
+    """Pick the provider that owns the lock right now.
+
+    Returns (target, conflicts, available). Only an enabled provider is a valid
+    target: writing to a disabled clone is exactly the bug that made Apply look
+    like it did nothing. A face-capable provider wins when several are enabled,
+    because it is the one adding a lock-time authentication flow.
+    """
+    targets = lock_targets()
+    enabled = [t for t in targets if t["enabled"] and t["has_service"]]
+    enabled.sort(key=lambda t: (0 if t["face"] else 1, t["id"]))
+    target = enabled[0] if enabled else None
+    conflicts = [t for t in enabled[1:]]
+    return target, conflicts, targets
+
+
+def view_state(target):
+    """Whether the provider currently holds this app's rendered view."""
+    if not target:
+        return {"generated": False, "current": False, "mtime": 0}
+    view = os.path.join(target["dir"], "LockView.qml")
+    try:
+        with open(view) as f:
+            text = f.read()
+        mtime = os.path.getmtime(view)
+    except Exception:
+        return {"generated": False, "current": False, "mtime": 0}
+    desired = render_for_target(load_settings(), target["dir"])[0]
+    return {"generated": GENERATED_MARKER in text,
+            "current": text == desired,
+            "mtime": int(mtime)}
+
+
+def lock_target_status():
+    """The target + warnings, for the UI and for --sync output."""
+    target, conflicts, available = resolve_lock_target()
+    warnings = []
+    if target is None:
+        if available:
+            warnings.append(
+                "Every lock provider in ~/.config/omarchy/plugins is disabled — "
+                "enable one (omarchy plugin enable " + available[0]["id"] +
+                ") or the shell runs its own stock lock.")
+        else:
+            warnings.append(
+                "No lock provider cloned into ~/.config yet — run "
+                "`omarchy plugin clone omarchy.lock` (or install omaFace) first.")
+    for t in conflicts:
+        warnings.append(
+            "%s is also an enabled lock service; only one may own the lock. "
+            "Disable it with `omarchy plugin disable %s`." % (t["id"], t["id"]))
+    return {
+        "id": target["id"] if target else "",
+        "dir": target["dir"] if target else "",
+        "face": bool(target and target["face"]),
+        "enabled": bool(target),
+        "providers": available,
+        "conflicts": [t["id"] for t in conflicts],
+        "warnings": warnings,
+        "view": view_state(target),
+    }
+
+def ensure_initial_backup(lockview_path, label=None):
+    """Keep one pristine copy of the provider's own view.
+
+    An Omarchy/omaFace update may rebuild LockView.qml; restoring stock must then
+    fall back to the provider's build, never to our generated file. A per-plugin
+    copy is used when a label is given, so omaFace and a plain clone do not share
+    one "stock" view.
+    """
+    if label:
+        dest = os.path.join(BACKUP_DIR, "stock-%s-LockView.qml" % label)
+        if os.path.isfile(dest):
+            return dest
+        if lockview_path and os.path.isfile(lockview_path):
+            with open(lockview_path) as f:
+                if GENERATED_MARKER in f.read():
+                    return None
+            import shutil
+            shutil.copy2(lockview_path, dest)
+            return dest
+        return None
     if lockview_path and os.path.isfile(lockview_path) and not os.path.isfile(INITIAL_BACKUP):
         import shutil
         shutil.copy2(lockview_path, INITIAL_BACKUP)
+    return INITIAL_BACKUP
+
+
+def stock_backup_for(target_dir):
+    """The untouched view for this provider, or the legacy shared backup."""
+    label = os.path.basename(target_dir.rstrip("/")) if target_dir else ""
+    dest = os.path.join(BACKUP_DIR, "stock-%s-LockView.qml" % label)
+    if label and os.path.isfile(dest):
+        return dest
+    return INITIAL_BACKUP if os.path.isfile(INITIAL_BACKUP) else None
 
 def installed_fonts():
     """Font family names for the Typography datalist, straight from fontconfig."""
@@ -379,17 +603,25 @@ def installed_fonts():
 
 
 def ensure_face_glyph(plugin_dir):
-    """Write the bundled FaceGlyph.qml next to LockView.qml if it is missing."""
+    """Install the studio's own face mark next to LockView.qml.
+
+    The view references `LockStudioFaceGlyph.qml`, a file this app owns, rather
+    than the provider's `FaceGlyph.qml`. A provider update may change its own
+    component's properties; a customized view that called them would then fail
+    to load, so the mark is not shared. The provider's file is left untouched
+    for its own (rebuilt) LockView.
+    """
     if not plugin_dir:
         return None
-    path = os.path.join(plugin_dir, "FaceGlyph.qml")
+    path = os.path.join(plugin_dir, "LockStudioFaceGlyph.qml")
     try:
+        existing = ""
         if os.path.isfile(path):
             with open(path) as f:
-                if f.read() == FACE_GLYPH_QML:
-                    return path
-        with open(path, "w") as f:
-            f.write(FACE_GLYPH_QML)
+                existing = f.read()
+        if existing != FACE_GLYPH_QML:
+            with open(path, "w") as f:
+                f.write(FACE_GLYPH_QML)
         return path
     except Exception:
         return None
@@ -401,6 +633,15 @@ def load_settings():
             s = json.load(open(SETTINGS_PATH))
             merged = dict(DEFAULT_SETTINGS)
             merged.update(s)
+            # Older builds rotated a quote list every N seconds; carry the rest
+            # of that block over to the verse settings and drop the interval.
+            for old, new in (("quotes_enabled", "verses_enabled"),
+                             ("quotes_pos", "verses_pos"),
+                             ("quotes_big", "verses_big")):
+                if old in s:
+                    merged[new] = s[old]
+                    merged.pop(old, None)
+            merged.pop("quote_interval", None)
             return merged
         except Exception:
             pass
@@ -591,12 +832,28 @@ def playerctl_snapshot():
     return {"title": title, "artist": artist, "art": art, "playing": playing}
 
 def restart_shell():
-    try:
-        subprocess.run(["omarchy", "restart", "shell"], check=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-        return True, "restarted shell"
-    except Exception as e:
-        return False, str(e)
+    """Restart the shell, preferring the documented command.
+
+    Falls back to the underlying binary so a reshuffle of the `omarchy` CLI
+    verbs does not break the repair path. A locked session refuses the restart,
+    and that answer is returned instead of being retried.
+    """
+    last = "no restart command available"
+    for cmd in (["omarchy", "restart", "shell"], ["omarchy-restart-shell"]):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        except FileNotFoundError:
+            last = "not found: " + cmd[0]
+            continue
+        except Exception as e:
+            last = str(e)
+            continue
+        if p.returncode == 0:
+            return True, "restarted shell"
+        last = ((p.stderr or "") + (p.stdout or "")).strip() or ("exit %d" % p.returncode)
+        if "Refusing to restart" in last:
+            return False, last
+    return False, last
 
 def free_port(port):
     """Best-effort: kill whatever process is holding the given TCP port so a new
@@ -702,7 +959,6 @@ def process_image(path, kind):
 TEMPLATE = r'''import QtQuick
 import QtQuick.Effects
 import qs.Commons
-import qs.Ui
 import Quickshell
 import Quickshell.Io
 
@@ -710,8 +966,10 @@ Item {
   id: root
 
   property string backgroundPath: ""
+  property string videoPosterPath: ""
   property int backgroundVersion: 0
   property bool fingerprintConfigured: false
+  property bool fingerprintUnavailable: false
   property bool authenticatingPassword: false
   property string failureMessage: ""
   property int failedAttempts: 0
@@ -756,9 +1014,7 @@ Item {
     : 1
   readonly property bool showPasswordCursor: inputEnabled && !authenticatingPassword && failureMessage.length === 0
   readonly property bool errorState: failureMessage.length > 0
-  readonly property var inputBorderSpec: errorState
-    ? Border.surfaceSpec("lock", "border-error", Color.lock.borderError, root.outlineThickness, "border-alpha")
-    : Border.surfaceSpec("lock", "border-active", Color.lock.borderActive, root.outlineThickness, "border-alpha")
+  readonly property color borderColor: errorState ? Color.lock.borderError : Color.lock.borderActive
 
   signal submitPassword(string password)
   signal passwordTextEdited(string password)
@@ -859,7 +1115,7 @@ Item {
       visible: (root.faceAvailable && root.faceState !== "unavailable") || root.faceState === "success"
       opacity: visible ? 1 : 0
 
-      FaceGlyph {
+      LockStudioFaceGlyph {
         objectName: "faceIndicator"
         anchors.centerIn: parent
         width: Math.round(parent.width * 0.66)
@@ -897,23 +1153,26 @@ Item {
       font.pixelSize: root.faceLive !== "" ? Style.font.body : Style.font.bodySmall
     }
 
-    BorderSurface {
+    // A plain Rectangle instead of qs.Ui's BorderSurface: one less Omarchy
+    // component whose API could change out from under a customized view.
+    Rectangle {
       id: inputField
       width: root.fieldWidth
       height: root.fieldHeight
       anchors.centerIn: parent
       color: Color.lock.background
-      borderSpec: root.inputBorderSpec
       radius: Style.cornerRadius
+      border.width: root.outlineThickness
+      border.color: root.borderColor
       clip: true
 
       TextInput {
         id: passwordInput
         anchors.fill: parent
-        anchors.topMargin: inputField.borderTop
-        anchors.rightMargin: inputField.borderRight + 18 + root.fingerprintReserve
-        anchors.bottomMargin: inputField.borderBottom
-        anchors.leftMargin: inputField.borderLeft + 18 + root.fingerprintReserve
+        anchors.topMargin: root.outlineThickness
+        anchors.rightMargin: root.outlineThickness + 18 + root.fingerprintReserve
+        anchors.bottomMargin: root.outlineThickness
+        anchors.leftMargin: root.outlineThickness + 18 + root.fingerprintReserve
         verticalAlignment: TextInput.AlignVCenter
         horizontalAlignment: TextInput.AlignHCenter
         activeFocusOnPress: true
@@ -976,7 +1235,7 @@ Item {
         id: fingerprintIcon
         objectName: "fingerprintIndicator"
         anchors.right: parent.right
-        anchors.rightMargin: inputField.borderRight + 18
+        anchors.rightMargin: root.outlineThickness + 18
         anchors.verticalCenter: parent.verticalCenter
         visible: root.fingerprintConfigured
         text: "󰈷"
@@ -1015,22 +1274,31 @@ Item {
         text: ""
         id: clkDate
       }
-      Component.onCompleted: {
+      // Qt.formatTime/Qt.formatDate are the QML globals that honour a date
+      // format string everywhere; Date.toLocale* with a format silently falls
+      // back to the locale default in this engine (that is why the clock used
+      // to show 11/10/26 instead of the configured date).
+      function refreshClock() {
         var d = new Date()
-        var tz = (__CLOCK_TZ__ !== "") ? __CLOCK_TZ__ : undefined
-        clkTime.text = d.toLocaleTimeString(Qt.locale(), __CLOCK_FORMAT__, undefined, tz)
-        clkDate.text = d.toLocaleDateString(Qt.locale(), __CLOCK_DATE__, undefined, tz)
+        var tz = __CLOCK_TZ__
+        if (tz !== "") {
+          try {
+            var local = new Date(d.toLocaleString("en-US"))
+            var there = new Date(d.toLocaleString("en-US", { timeZone: tz }))
+            d = new Date(d.getTime() + (there.getTime() - local.getTime()))
+          } catch (e) {
+            // No zone database here; show local time rather than nothing.
+          }
+        }
+        clkTime.text = Qt.formatTime(d, __CLOCK_FORMAT__)
+        clkDate.text = Qt.formatDate(d, __CLOCK_DATE__)
       }
+      Component.onCompleted: refreshClock()
       Timer {
         interval: 1000
         running: __CLOCK_ENABLED__
         repeat: true
-        onTriggered: {
-          var d = new Date()
-          var tz = (__CLOCK_TZ__ !== "") ? __CLOCK_TZ__ : undefined
-          clkTime.text = d.toLocaleTimeString(Qt.locale(), __CLOCK_FORMAT__, undefined, tz)
-          clkDate.text = d.toLocaleDateString(Qt.locale(), __CLOCK_DATE__, undefined, tz)
-        }
+        onTriggered: clockBox.refreshClock()
       }
     }
 
@@ -1090,60 +1358,62 @@ Item {
       }
     }
 
-    // ===================== Dev quotes =====================
+    // ===================== Bible verse (NKJV) =====================
+    // One verse per clock hour. The slot is the hour count since the epoch, so
+    // the verse turns over exactly on the hour, and the lock and the studio's
+    // preview always agree on which verse an hour carries.
     Column {
-      id: quoteBox
-      visible: __QUOTES_ENABLED__
-      width: Math.min(parent.width * 0.7, 900)
+      id: verseBox
+      visible: __VERSES_ENABLED__
+      width: __VERSE_WIDTH__
       anchors.horizontalCenter: parent.horizontalCenter
-      anchors.top: (__QUOTES_POS__.indexOf("top") >= 0) ? parent.top : undefined
-      anchors.bottom: (__QUOTES_POS__.indexOf("top") >= 0) ? undefined : parent.bottom
+      anchors.horizontalCenterOffset: __VERSE_OFFSET__
+      anchors.top: (__VERSES_POS__.indexOf("top") >= 0) ? parent.top : undefined
+      anchors.bottom: (__VERSES_POS__.indexOf("top") >= 0) ? undefined : parent.bottom
       anchors.topMargin: 56
       anchors.bottomMargin: 56
-      property var quotes: __QUOTES_LIST__
-      property int quoteIdx: 0
+      property var verses: __VERSES_LIST__
+      function showVerse() {
+        if (!verses || verses.length === 0) return
+        var v = verses[Math.floor(Date.now() / 3600000) % verses.length]
+        var sep = v.lastIndexOf(" — ")
+        if (sep < 0) sep = v.lastIndexOf(" - ")
+        if (sep >= 0) { verseText.text = v.substring(0, sep); verseRef.text = v.substring(sep + 3) }
+        else { verseText.text = v; verseRef.text = "" }
+      }
+      // Wait for the next hour boundary, then land on the hour every hour.
+      Timer {
+        interval: 3600000 - (Date.now() % 3600000)
+        running: __VERSES_ENABLED__ && verseBox.verses.length > 0
+        repeat: false
+        onTriggered: {
+          verseBox.showVerse()
+          interval = 3600000
+          restart()
+        }
+      }
       Text {
-        id: quoteText
+        id: verseText
         width: parent.width
         wrapMode: Text.WrapAtWordBoundaryOrAnywhere
         horizontalAlignment: Text.AlignHCenter
         color: root.lockTextColor
         font.family: root.textFontFamily
-        font.pixelSize: Math.round(Style.font.heading * (__QUOTES_BIG__ ? 1.15 : 0.8))
+        font.pixelSize: Math.round(Style.font.heading * (__VERSES_BIG__ ? 1.15 : 0.8))
         font.italic: true
         text: ""
       }
       Text {
-        id: quoteAuthor
+        id: verseRef
         width: parent.width
         wrapMode: Text.Wrap
         horizontalAlignment: Text.AlignHCenter
         color: root.lockPlaceholderColor
         font.family: root.textFontFamily
-        font.pixelSize: Math.round(Style.font.heading * (__QUOTES_BIG__ ? 0.85 : 0.6))
+        font.pixelSize: Math.round(Style.font.heading * (__VERSES_BIG__ ? 0.85 : 0.6))
         text: ""
       }
-      Component.onCompleted: {
-        var q0 = quoteBox.quotes[quoteBox.quoteIdx % quoteBox.quotes.length]
-        quoteBox.quoteIdx = (quoteBox.quoteIdx + 1) % quoteBox.quotes.length
-        var s0 = q0.lastIndexOf(" — ")
-        if (s0 < 0) s0 = q0.lastIndexOf(" - ")
-        if (s0 >= 0) { quoteText.text = q0.substring(0, s0); quoteAuthor.text = q0.substring(s0 + 3) }
-        else { quoteText.text = q0; quoteAuthor.text = "" }
-      }
-      Timer {
-        interval: __QUOTE_INTERVAL__ * 1000
-        running: __QUOTES_ENABLED__
-        repeat: true
-        onTriggered: {
-          var q = quoteBox.quotes[quoteBox.quoteIdx % quoteBox.quotes.length]
-          quoteBox.quoteIdx = (quoteBox.quoteIdx + 1) % quoteBox.quotes.length
-          var sep = q.lastIndexOf(" — ")
-          if (sep < 0) sep = q.lastIndexOf(" - ")
-          if (sep >= 0) { quoteText.text = q.substring(0, sep); quoteAuthor.text = q.substring(sep + 3) }
-          else { quoteText.text = q; quoteAuthor.text = "" }
-        }
-      }
+      Component.onCompleted: showVerse()
     }
 
     // ===================== MPRIS media =====================
@@ -1278,6 +1548,20 @@ def render_lockview(s):
     avatar = s.get("profile_avatar", "")
     if avatar:
         avatar = os.path.expanduser(avatar)
+    # The verse is centred and the profile sits in a bottom corner, so a wide
+    # verse runs straight through the name. When both share the bottom band,
+    # narrow the verse and nudge it away from the profile.
+    quote_width = "Math.min(parent.width * 0.7, 900)"
+    quote_offset = "0"
+    prof_pos = s.get("profile_pos", "bottom-left")
+    verses_pos = s.get("verses_pos", "bottom-center")
+    if (s.get("profile_enabled") and s.get("verses_enabled")
+            and prof_pos.split("-")[0] == verses_pos.split("-")[0]):
+        quote_width = "Math.min(parent.width * 0.55, 820)"
+        if "left" in prof_pos and "center" in verses_pos:
+            quote_offset = "Math.round(parent.width * 0.07)"
+        elif "right" in prof_pos and "center" in verses_pos:
+            quote_offset = "-Math.round(parent.width * 0.07)"
     mode = s.get("text_color_mode", "theme")
     if mode == "theme":
         lock_text = "Color.lock.text"
@@ -1309,10 +1593,11 @@ def render_lockview(s):
         "__PROFILE_POS__": qstr(s["profile_pos"]),
         "__SHOW_WELCOME__": qbool(s["show_welcome"]),
         "__WELCOME_TEXT__": qstr(s["welcome_text"]),
-        "__QUOTES_ENABLED__": qbool(s["quotes_enabled"]),
-        "__QUOTE_INTERVAL__": qnum(int(s["quote_interval"])),
-        "__QUOTES_POS__": qstr(s["quotes_pos"]),
-        "__QUOTES_BIG__": qbool(s["quotes_big"]),
+        "__VERSES_ENABLED__": qbool(s["verses_enabled"]),
+        "__VERSES_POS__": qstr(s["verses_pos"]),
+        "__VERSE_WIDTH__": quote_width,
+        "__VERSE_OFFSET__": quote_offset,
+        "__VERSES_BIG__": qbool(s["verses_big"]),
         "__MEDIA_ENABLED__": qbool(s["media_enabled"]),
         "__MEDIA_POS__": qstr(s["media_pos"]),
         "__BG_IMAGE__": qstr(bg),
@@ -1320,12 +1605,389 @@ def render_lockview(s):
         "__BG_DIM__": qnum(s["bg_dim"]),
         "__LOCK_TEXT_COLOR__": lock_text,
         "__LOCK_PLACEHOLDER_COLOR__": lock_ph,
-        "__QUOTES_LIST__": json.dumps(QUOTES),
+        "__VERSES_LIST__": json.dumps(VERSES, ensure_ascii=False),
     }
     out = TEMPLATE
     for k, v in sub.items():
         out = out.replace(k, v)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Host contract (columns the running Service.qml hands to LockView)
+# ---------------------------------------------------------------------------
+# An update to Omarchy or omaFace can add a property to the LockView instance
+# inside Service.qml (4.5 added videoPosterPath and fingerprintUnavailable).
+# Assigning a property the view does not declare is a QML runtime error, and the
+# lock then has no view at all. So the host's own Service.qml is read and any
+# property it assigns that the template lacks is declared as `property var`
+# (and any on<Signal> handler as a no-argument signal) — the view keeps loading
+# and ignores what the studio does not render yet.
+
+def _balanced_block(text, start):
+    """Text between the brace at `start` and its match, nested braces included."""
+    depth = 1
+    i = start
+    while i < len(text) and depth:
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        i += 1
+    return text[start:i - 1]
+
+
+def service_contract(service_path):
+    """What the host Service.qml requires of a LockView.
+
+    Returns (properties, signals, function_calls).
+    """
+    props, signals, calls = set(), set(), set()
+    try:
+        with open(service_path) as f:
+            text = f.read()
+    except Exception:
+        return props, signals, calls
+    for m in re.finditer(r"\bLockView\s*\{", text):
+        block = _balanced_block(text, m.end())
+        lines = [ln for ln in block.splitlines() if ln.strip() and not ln.strip().startswith("//")]
+        if not lines:
+            continue
+        base = min(len(ln) - len(ln.lstrip()) for ln in lines)
+        for ln in lines:
+            if len(ln) - len(ln.lstrip()) != base:
+                continue
+            hit = re.match(r"\s*([A-Za-z_]\w*)\s*:", ln)
+            if not hit:
+                continue
+            name = hit.group(1)
+            if len(name) > 2 and name.startswith("on") and name[2].isupper():
+                signals.add(name[2].lower() + name[3:])
+            elif name != "id":
+                props.add(name)
+    # Service.qml may also call methods on the view (lockView.clearPassword()).
+    # A missing function is only an error when it is called, so stub anything
+    # the view does not define instead of discovering it at lock time.
+    for m in re.finditer(r"\blockView\.([A-Za-z_]\w*)\s*\(", text):
+        calls.add(m.group(1))
+    return props, signals, calls
+
+
+def declared_in_view(qml_text):
+    props = set(re.findall(r"^[ \t]*(?:readonly\s+)?property\s+[\w.<>]+\s+(\w+)", qml_text, re.M))
+    signals = set(re.findall(r"^[ \t]*signal\s+(\w+)", qml_text, re.M))
+    functions = set(re.findall(r"^[ \t]*function\s+(\w+)\s*\(", qml_text, re.M))
+    return props, signals, functions
+
+
+def apply_contract(qml_text, service_path):
+    """Declare anything the host requires that the view is missing.
+
+    Returns (text, added_properties, added_signals, added_functions).
+    """
+    want_props, want_signals, want_calls = service_contract(service_path)
+    have_props, have_signals, have_functions = declared_in_view(qml_text)
+    add_props = sorted(want_props - have_props)
+    add_signals = sorted(want_signals - have_signals)
+    add_functions = sorted(want_calls - have_functions)
+    if not add_props and not add_signals and not add_functions:
+        return qml_text, [], [], []
+    shim = ["  // --- host contract, refreshed by omarchy-lock-studio after updates ---"]
+    for name in add_props:
+        shim.append('  property var %s: ""' % name)
+    for name in add_signals:
+        shim.append("  signal %s()" % name)
+    for name in add_functions:
+        shim.append("  function %s() {}" % name)
+    anchor = "  // --- omarchy-lock-studio settings (generated, do not edit by hand) ---"
+    block = "\n".join(shim) + "\n\n"
+    if anchor in qml_text:
+        qml_text = qml_text.replace(anchor, block + anchor, 1)
+    else:
+        qml_text = qml_text.replace("  id: root\n", "  id: root\n\n" + block, 1)
+    return qml_text, add_props, add_signals, add_functions
+
+
+def render_for_target(settings, target_dir):
+    """Render the saved settings for one provider, with the host contract met."""
+    text = render_lockview(settings)
+    text = ("// " + GENERATED_MARKER + " — safe to delete; re-apply from the app.\n"
+            + text)
+    if not target_dir:
+        return text, [], [], []
+    return apply_contract(text, os.path.join(target_dir, "Service.qml"))
+
+
+# ---------------------------------------------------------------------------
+# Validation and rollback
+# ---------------------------------------------------------------------------
+# The lock service builds its WlSessionLockSurface (and therefore this view) at
+# load time, so a bad view is silent until the shell restarts — and then the
+# lock has no field to type into. Nothing unverified may reach the file the
+# shell loads, and a change that fails after restart must put the last working
+# view back on its own.
+
+def unbalanced(text):
+    """True when braces/brackets/parens do not balance outside strings."""
+    pairs = {")": "(", "]": "[", "}": "{"}
+    stack = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            i = text.find("\n", i)
+            if i < 0:
+                break
+        elif ch == "/" and i + 1 < n and text[i + 1] == "*":
+            end = text.find("*/", i + 2)
+            if end < 0:
+                return True
+            i = end + 2
+            continue
+        elif ch in "\"'`":
+            quote = ch
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == quote:
+                    break
+                i += 1
+        elif ch in "([{":
+            stack.append(ch)
+        elif ch in ")]}":
+            if not stack or stack.pop() != pairs[ch]:
+                return True
+        i += 1
+    return bool(stack)
+
+
+def validate_view(text, service_path):
+    """Problems that must stop an install, as a list of strings."""
+    problems = []
+    leftovers = sorted(set(re.findall(r"__[A-Z][A-Z0-9_]*__", text)))
+    if leftovers:
+        problems.append("unfilled template tokens: " + ", ".join(leftovers))
+    if "id: root" not in text:
+        problems.append("root item is missing")
+    if unbalanced(text):
+        problems.append("unbalanced braces, brackets or parentheses")
+    for need in ("import QtQuick", "import qs.Commons"):
+        if need not in text:
+            problems.append("missing " + need)
+    if service_path:
+        want_props, want_signals, want_calls = service_contract(service_path)
+        have_props, have_signals, have_functions = declared_in_view(text)
+        missing = sorted((want_props - have_props) | (want_signals - have_signals)
+                         | (want_calls - have_functions))
+        if missing:
+            problems.append("host contract unmet: " + ", ".join(missing))
+    # A syntax pass with Qt's own parser when it is installed.
+    lint = "/usr/bin/qmllint"
+    if os.path.isfile(lint):
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(suffix=".qml", prefix="lock-studio-check-")
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+            p = subprocess.run([lint, tmp], capture_output=True, text=True, timeout=20)
+            if p.returncode != 0 and (p.stdout + p.stderr).strip():
+                problems.append("qmllint: " + (p.stdout + p.stderr).strip()[:400])
+        except Exception:
+            pass
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+    return problems
+
+
+SHELL_ERROR_PATTERNS = (
+    "Cannot assign to non-existent property",
+    "Unable to assign",
+    "is not a type",
+    "LockView",
+)
+
+
+def shell_errors_since(epoch, target=None):
+    """Shell log lines since `epoch` that mean the lock view did not load.
+
+    Only lines about this plugin, or about LockView itself, count: another
+    plugin's stale import must not trigger a rollback of a good lock view.
+    """
+    try:
+        p = subprocess.run(["journalctl", "--user", "-t", "omarchy-shell",
+                            "--since", "@%.3f" % float(epoch), "--no-pager"],
+                           capture_output=True, text=True, timeout=20)
+    except Exception:
+        return []
+    marker = os.path.basename((target or {}).get("dir", "").rstrip("/"))
+    out = []
+    for line in (p.stdout or "").splitlines():
+        if "rror" not in line and "WARN" not in line:
+            continue
+        about_us = "LockView" in line or (marker and marker in line)
+        if about_us and any(pat in line for pat in SHELL_ERROR_PATTERNS):
+            out.append(line.strip())
+    return out
+
+
+def wait_shell_ready(timeout=30):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            p = subprocess.run(["omarchy-shell", "shell", "ping"],
+                               capture_output=True, text=True, timeout=5)
+            if p.returncode == 0:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def last_good_path(target_dir):
+    return os.path.join(BACKUP_DIR, "last-good-%s-LockView.qml"
+                        % os.path.basename(target_dir.rstrip("/")))
+
+
+def install_view(target, text, label="pre-apply"):
+    """Atomically install a validated view, keeping one copy that is known good.
+
+    The previous file is always backed up first, and the text must already have
+    passed validate_view().
+    """
+    view = os.path.join(target["dir"], "LockView.qml")
+    ensure_initial_backup(view, label=os.path.basename(target["dir"]))
+    ensure_face_glyph(target["dir"])
+    backup_current(view, label=label)
+    tmp = view + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, view)
+    return view
+
+
+def rollback_view(target, reason):
+    """Put the last view that loaded back on disk. Returns (ok, detail)."""
+    view = os.path.join(target["dir"], "LockView.qml")
+    for candidate, name in ((last_good_path(target["dir"]), "last good view"),
+                            (stock_backup_for(target["dir"]), "stock view")):
+        if candidate and os.path.isfile(candidate):
+            try:
+                import shutil
+                backup_current(view, label="pre-rollback")
+                shutil.copy2(candidate, view)
+                return True, "restored the %s (%s)" % (name, reason)
+            except Exception as e:
+                return False, "rollback failed: %s" % e
+    return False, "no last-good or stock view to restore (%s)" % reason
+
+
+def restore_stock_view(target):
+    """Remove the customization from exactly one provider."""
+    view = os.path.join(target["dir"], "LockView.qml")
+    stock = stock_backup_for(target["dir"])
+    if not stock or not os.path.isfile(stock):
+        return False, "no stock view saved for this plugin yet"
+    import shutil
+    backup_current(view, label="pre-stock")
+    shutil.copy2(stock, view)
+    return True, "stock view restored"
+
+
+def apply_view(settings, target=None, restart=True, verify=True):
+    """Render, validate, install, reload, verify; roll back if it did not load.
+
+    This is the only path that writes LockView.qml, so a broken render can never
+    reach the shell: validation happens before the write, and a view that still
+    fails after the restart is replaced by the last one that worked.
+    """
+    conflicts = []
+    if target is None:
+        target, conflicts, _available = resolve_lock_target()
+    if not target:
+        status = lock_target_status()
+        return {"ok": False, "lock": status,
+                "error": status["warnings"][0] if status["warnings"] else "no enabled lock plugin"}
+
+    service = os.path.join(target["dir"], "Service.qml")
+    text, add_props, add_signals, add_functions = render_for_target(settings, target["dir"])
+    problems = validate_view(text, service)
+    if problems:
+        return {"ok": False, "id": target["id"], "dir": target["dir"],
+                "error": "refusing to install: " + "; ".join(problems),
+                "problems": problems}
+
+    view = os.path.join(target["dir"], "LockView.qml")
+    try:
+        with open(view) as f:
+            current = f.read()
+    except Exception:
+        current = ""
+    changed = current != text
+    if changed:
+        install_view(target, text)
+
+    result = {"ok": True, "id": target["id"], "dir": target["dir"],
+              "changed": changed, "verified": None,
+              "added_properties": add_props, "added_signals": add_signals,
+              "added_functions": add_functions,
+              "conflicts": [t["id"] for t in conflicts]}
+    if not changed:
+        # Anything already on disk and running is a known-good fallback.
+        if not os.path.isfile(last_good_path(target["dir"])):
+            try:
+                with open(last_good_path(target["dir"]), "w") as f:
+                    f.write(current or text)
+            except Exception:
+                pass
+        return result
+    if not restart:
+        return result
+
+    started = time.time()
+    ok, err = restart_shell()
+    result["restarted"] = ok
+    if not ok:
+        # A locked session is the one expected refusal: the file is installed
+        # and takes effect at the next shell start, never by dropping the lock
+        # client. Any other failure means nothing will pick the change up.
+        result["restart_error"] = err
+        result["verified"] = False
+        if "Refusing to restart" not in (err or ""):
+            result["ok"] = False
+            result["error"] = "shell restart failed: " + (err or "unknown")
+        return result
+
+    wait_shell_ready()
+    if not verify:
+        return result
+    load_errors = shell_errors_since(started, target)
+    if not load_errors and not wait_shell_ready(timeout=5):
+        load_errors = ["the shell did not answer after the restart"]
+    if not load_errors:
+        result["verified"] = True
+        try:
+            with open(last_good_path(target["dir"]), "w") as f:
+                f.write(text)
+        except Exception:
+            pass
+        return result
+
+    rolled, detail = rollback_view(target, "new view failed to load")
+    result.update({"ok": False, "verified": False, "load_errors": load_errors[:5],
+                   "rollback": detail,
+                   "error": "view failed to load after restart: " + load_errors[0][:200]})
+    if rolled:
+        restart_shell()
+        wait_shell_ready()
+    return result
 
 # ---------------------------------------------------------------------------
 # Authentication backends (fingerprint / face)
@@ -1455,8 +2117,77 @@ def fingerprint_status():
     }
 
 
+THEME_TOML = os.path.expanduser("~/.local/state/omarchy/current/theme/shell.toml")
+USER_TOML = os.path.expanduser("~/.config/omarchy/shell.toml")
+
+
+def _shell_toml(*paths):
+    """Flat {"section.key": value} from the shell's TOML, user file last."""
+    vals = {}
+    for path in paths:
+        try:
+            section = ""
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    m = re.match(r"^\[([A-Za-z0-9_-]+)\]", line)
+                    if m:
+                        section = m.group(1)
+                        continue
+                    m = re.match(r'^([A-Za-z0-9_-]+)\s*=\s*["\']?([^"\'#]+)["\']?\s*(?:#.*)?$', line)
+                    if m and section:
+                        vals[section + "." + m.group(1)] = m.group(2).strip()
+        except Exception:
+            continue
+    return vals
+
+
+def shell_heading_px():
+    """Style.font.heading in pixels — the size the lock's text derives from.
+
+    Read from Omarchy's own shell.toml (theme base, then the user override) so
+    the preview draws the clock at the size the lock screen really uses.
+    """
+    vals = _shell_toml(THEME_TOML, USER_TOML)
+    try:
+        base = max(1, int(float(vals.get("font.base-size", 12))))
+    except Exception:
+        base = 12
+    try:
+        return max(1, int(float(vals["font.heading"])))
+    except Exception:
+        return max(1, round(base * 1.333))
+
+
+def screen_size():
+    """Logical size of the focused monitor (Hyprland reports pixels + scale)."""
+    try:
+        out = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True,
+                             text=True, timeout=5).stdout
+        mons = [m for m in json.loads(out) if not m.get("disabled")]
+        m = next((m for m in mons if m.get("focused")), mons[0] if mons else None)
+        if m:
+            sc = float(m.get("scale") or 1) or 1
+            w, h = int(round(m["width"] / sc)), int(round(m["height"] / sc))
+            if w > 0 and h > 0:
+                return {"width": w, "height": h}
+    except Exception:
+        pass
+    return {"width": 1920, "height": 1080}
+
+
+def preview_info():
+    """Everything the preview needs to look like the real lock screen."""
+    size = screen_size()
+    return {"width": size["width"], "height": size["height"],
+            "heading": shell_heading_px()}
+
+
 def auth_status():
-    return {"face": face_status(), "fingerprint": fingerprint_status()}
+    return {"face": face_status(), "fingerprint": fingerprint_status(),
+            "lock": lock_target_status()}
 
 
 def launch_terminal(command):
@@ -1531,7 +2262,14 @@ HTML = r'''<!DOCTYPE html>
     width: 380px; min-width: 380px; overflow-y: auto; padding: 18px;
     background: #14141c; border-right: 1px solid #26263a;
   }
-  #stage { flex: 1; display: flex; align-items: center; justify-content: center; padding: 24px; }
+  #stage { flex: 1; display: flex; align-items: center; justify-content: center; padding: 24px; overflow: hidden; }
+  /* The preview is the lock screen at the real screen's size, scaled down with
+     a transform: every px inside it then means what it means on the lock. */
+  #screenWrap { position: relative; width: 960px; height: 540px; margin: auto; }
+  #stage.zoomed { overflow: auto; }
+  #zoom { position: fixed; right: 14px; bottom: 14px; display: flex; gap: 6px; z-index: 6; }
+  #zoom button { padding: 6px 10px; font-size: 11px; background: rgba(20,20,28,.9); }
+  #zoom button.on { border-color: var(--accent); color: var(--accent); }
   h1 { font-size: 16px; margin: 0 0 4px; color: var(--accent); }
   .sub { font-size: 11px; color: var(--muted); margin-bottom: 16px; }
   .group { border: 1px solid #26263a; border-radius: 10px; padding: 12px; margin-bottom: 12px; }
@@ -1541,6 +2279,15 @@ HTML = r'''<!DOCTYPE html>
   input[type=text], select {
     background: #0d0d14; color: var(--fg); border: 1px solid #2e2e44;
     border-radius: 6px; padding: 5px 7px; font-family: inherit; font-size: 12px; width: 180px;
+  }
+  /* Draw the arrow ourselves: WebKitGTK otherwise paints a native light
+     select and the option text disappears into it. */
+  select {
+    appearance: none; -webkit-appearance: none; padding-right: 26px;
+    background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+                      linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+    background-position: calc(100% - 16px) 52%, calc(100% - 11px) 52%;
+    background-size: 5px 5px, 5px 5px; background-repeat: no-repeat;
   }
   input[type=range] { width: 150px; }
   input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); }
@@ -1553,32 +2300,32 @@ HTML = r'''<!DOCTYPE html>
   button.danger { background: #f38ba8; }
   /* Lock preview */
   #screen {
-    position: relative; width: 100%; max-width: 900px; aspect-ratio: 16/9;
+    position: absolute; left: 0; top: 0; width: 1920px; height: 1080px;
     border-radius: 16px; overflow: hidden; background: var(--bg);
-    box-shadow: 0 20px 60px rgba(0,0,0,.5);
+    box-shadow: 0 20px 60px rgba(0,0,0,.5); transform-origin: top left;
   }
   #screen .bg { position: absolute; inset: 0; background-size: cover; background-position: center; filter: blur(8px); transform: scale(1.1); }
   #screen .dim { position: absolute; inset: 0; background: #000; opacity: 0.25; }
   .pw {
     position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%);
-    width: 300px; height: 52px; border-radius: 12px; background: rgba(255,255,255,.06);
+    width: 381px; height: 67px; border-radius: 12px; background: rgba(255,255,255,.06);
     border: 2px solid var(--accent); display: flex; align-items: center; justify-content: center;
-    color: var(--muted); font-size: 14px; letter-spacing: 2px;
+    color: var(--muted); letter-spacing: 2px;
   }
   .w-clock { position: absolute; left: 50%; transform: translateX(-50%); text-align: center; color: var(--fg); }
   .w-clock .t { font-weight: bold; }
-  .w-clock .d { color: var(--muted); }
-  .w-profile { position: absolute; display: flex; gap: 12px; align-items: center; color: var(--fg); }
-  .w-profile .av { width: 52px; height: 52px; border-radius: 50%; background: rgba(255,255,255,.08); display:flex; align-items:center; justify-content:center; font-weight:bold; overflow:hidden; }
+  .w-clock .d { color: var(--muted); margin-top: 6px; }
+  .w-profile { position: absolute; display: flex; gap: 16px; align-items: center; color: var(--fg); }
+  .w-profile .av { width: 72px; height: 72px; border-radius: 50%; background: rgba(255,255,255,.08); display:flex; align-items:center; justify-content:center; font-weight:bold; overflow:hidden; font-size: 30px; }
   .w-profile .av img { width:100%; height:100%; object-fit: cover; }
   .w-profile .nm { font-weight: bold; }
-  .w-profile .ho { color: var(--muted); font-size: 12px; }
+  .w-profile .ho { color: var(--muted); }
   .w-quote { position: absolute; left: 50%; transform: translateX(-50%); width: 70%; text-align: center; color: var(--fg); font-style: italic; }
-  .w-quote .a { color: var(--muted); font-style: normal; font-size: 12px; margin-top: 4px; }
+  .w-quote .a { color: var(--muted); font-style: normal; margin-top: 4px; }
   .w-media { position: absolute; display: flex; gap: 10px; align-items: center; color: var(--fg); }
-  .w-media .art { width: 44px; height: 44px; border-radius: 8px; background: rgba(255,255,255,.08); background-size: cover; }
-  .w-media .ti { font-weight: bold; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .w-media .ar { color: var(--muted); font-size: 12px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .w-media .art { width: 56px; height: 56px; border-radius: 8px; background: rgba(255,255,255,.08); background-size: cover; }
+  .w-media .ti { font-weight: bold; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .w-media .ar { color: var(--muted); max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: #1e1e2e; border:1px solid var(--accent); color: var(--fg); padding: 8px 14px; border-radius: 8px; font-size: 12px; opacity: 0; transition: opacity .3s; }
   .toast.show { opacity: 1; }
   .hint { font-size: 10px; color: var(--muted); margin-top: 6px; line-height: 1.4; }
@@ -1663,13 +2410,13 @@ HTML = r'''<!DOCTYPE html>
   </div>
 
   <div class="group">
-    <h2>Dev quotes</h2>
-    <label><span>Enabled</span><input type="checkbox" id="quotes_enabled"></label>
-    <label><span>Larger text</span><input type="checkbox" id="quotes_big"></label>
-    <label><span>Rotate every (s)</span><input type="text" id="quote_interval" value="12"></label>
-    <label><span>Position</span><select id="quotes_pos">
+    <h2>Bible verse (NKJV)</h2>
+    <label><span>Enabled</span><input type="checkbox" id="verses_enabled"></label>
+    <label><span>Larger text</span><input type="checkbox" id="verses_big"></label>
+    <label><span>Placement</span><select id="verses_pos">
       <option value="bottom-center">Bottom</option><option value="top-center">Top</option>
     </select></label>
+    <div class="hint">One verse from the New King James Version, and it turns over on the hour — no timer to tune.</div>
   </div>
 
   <div class="group">
@@ -1690,6 +2437,11 @@ HTML = r'''<!DOCTYPE html>
 
   <div class="group">
     <h2>Authentication</h2>
+
+    <div class="auth-card">
+      <div class="auth-head"><span class="auth-title">Lock screen service</span><span class="badge" id="lock-badge">checking…</span></div>
+      <div class="hint" id="lock-desc">—</div>
+    </div>
 
     <div class="auth-card">
       <div class="auth-head"><span class="auth-title">Face Recognition (omaFace)</span><span class="badge" id="face-badge">checking…</span></div>
@@ -1731,6 +2483,7 @@ HTML = r'''<!DOCTYPE html>
 </div>
 
 <div id="stage">
+  <div id="screenWrap">
   <div id="screen">
     <div class="bg" id="pv-bg"></div>
     <div class="dim" id="pv-dim"></div>
@@ -1738,8 +2491,13 @@ HTML = r'''<!DOCTYPE html>
     <div class="w-profile" id="pv-profile"><div class="av" id="pv-av"></div><div><div class="nm" id="pv-nm"></div><div class="ho" id="pv-ho"></div></div></div>
     <div class="w-quote" id="pv-quote"><div id="pv-qt"></div><div class="a" id="pv-qa"></div></div>
     <div class="w-media" id="pv-media"><div class="art" id="pv-art"></div><div><div class="ti" id="pv-ti"></div><div class="ar" id="pv-ar"></div></div></div>
-    <div class="pw">Enter Password</div>
+    <div class="pw" id="pv-pw">Enter Password</div>
   </div>
+  </div>
+</div>
+<div id="zoom">
+  <button class="ghost on" id="zoom-fit" type="button">Fit</button>
+  <button class="ghost" id="zoom-100" type="button">100%</button>
 </div>
 <div class="modal" id="picker"><div class="modal-box">
   <div class="modal-head"><span id="picker-path"></span><button class="ghost" id="picker-up" type="button">Up</button><button class="ghost" id="picker-cancel" type="button">Cancel</button></div>
@@ -1751,12 +2509,11 @@ HTML = r'''<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let S = {};
 let THEME = {};
-const QUOTES = __QUOTES_JSON__;
-let qIdx = 0;
+const VERSES = __VERSES_JSON__;
 
 const FIELDS = ["clock_enabled","clock_format","clock_show_seconds","clock_show_date","clock_date","clock_tz","clock_scale","clock_vpos","font_family","clock_font","clock_weight","clock_spacing",
   "profile_enabled","profile_name","profile_avatar","profile_show_host","profile_host","profile_pos",
-  "quotes_enabled","quote_interval","quotes_pos","quotes_big","show_welcome","welcome_text","text_color_mode","text_color","media_enabled","media_pos","bg_image","bg_blur","bg_dim"];
+  "verses_enabled","verses_pos","verses_big","show_welcome","welcome_text","text_color_mode","text_color","media_enabled","media_pos","bg_image","bg_blur","bg_dim"];
 
 function setVal(k,v){ if (typeof v === "boolean") $(k).checked = v; else if ($(k).type === "range" || $(k).type === "text" || $(k).tagName === "SELECT") $(k).value = v; }
 function getVal(k){ const el = $(k); if (el.type === "checkbox") return el.checked; if (el.type === "range") return parseFloat(el.value); return el.value; }
@@ -1790,13 +2547,14 @@ function fmtDate(d, f, tz){
 
 function renderPreview(){
   const bg = $("pv-bg");
-  if (S.bg_image) { bg.style.backgroundImage = "url('file://"+S.bg_image+"')"; bg.style.filter = "blur("+(S.bg_blur*8)+"px)"; }
+  if (S.bg_image) { bg.style.backgroundImage = "url('"+localImage(S.bg_image)+"')"; bg.style.filter = "blur("+(S.bg_blur*8)+"px)"; }
   else { bg.style.backgroundImage = "none"; bg.style.filter = "blur(8px)"; }
   $("pv-dim").style.opacity = (S.bg_dim===undefined?0.25:S.bg_dim);
   const clock = $("pv-clock");
-  if (S.clock_enabled){ clock.style.display="block"; clock.style.top = S.clock_vpos==="top"?"48px":"auto"; clock.style.bottom = S.clock_vpos==="top"?"auto":"48px"; }
+  if (S.clock_enabled){ clock.style.display="block"; clock.style.top = S.clock_vpos==="top"?"64px":"auto"; clock.style.bottom = S.clock_vpos==="top"?"auto":"64px"; }
   else clock.style.display="none";
-  $("pv-time").style.fontSize = (Style_h()*S.clock_scale)+"px";
+  $("pv-time").style.fontSize = Math.round(Style_h()*S.clock_scale)+"px";
+  $("pv-date").style.fontSize = Math.round(Style_h()*0.9)+"px";
   $("pv-date").style.display = S.clock_show_date?"block":"none";
   const baseFont = S.font_family || "";
   const clockFont = S.clock_font || baseFont;
@@ -1813,18 +2571,42 @@ function renderPreview(){
   $("pv-nm").style.display = (S.profile_enabled && S.show_welcome) ? "block" : "none";
   $("pv-ho").style.display = S.profile_show_host?"block":"none";
   $("pv-ho").textContent = S.profile_host||"";
+  $("pv-nm").style.fontSize = Math.round(Style_h()*0.9)+"px";
+  $("pv-ho").style.fontSize = Math.round(Style_h()*0.7)+"px";
   const av = $("pv-av");
-  if (S.profile_avatar){ av.innerHTML = '<img src="file://'+S.profile_avatar+'">'; }
+  if (S.profile_avatar){ av.innerHTML = '<img src="'+localImage(S.profile_avatar)+'">'; }
   else { av.textContent = (S.profile_name?S.profile_name[0].toUpperCase():"?"); }
 
   const q = $("pv-quote");
-  if (S.quotes_enabled){ q.style.display="block"; q.style.top = S.quotes_pos==="top"?"48px":"auto"; q.style.bottom = S.quotes_pos==="top"?"auto":"48px"; }
-  else q.style.display="none";
-  $("pv-qt").style.fontSize = (S.quotes_big ? 30 : 20) + "px";
-  $("pv-qa").style.fontSize = (S.quotes_big ? 16 : 13) + "px";
+  if (S.verses_enabled){
+    const atTop = S.verses_pos === "top";
+    const band = p => String(p || "bottom-center").split("-")[0];
+    // Same rule as the view: when the profile shares the verse's band, the
+    // verse narrows and steps aside instead of running through the name.
+    let width = Math.min(PREVIEW.width * 0.7, 900), offset = 0;
+    if (S.profile_enabled && band(S.profile_pos) === band(S.verses_pos)){
+      width = Math.min(PREVIEW.width * 0.55, 820);
+      if (String(S.profile_pos).includes("left")) offset = Math.round(PREVIEW.width * 0.07);
+      else if (String(S.profile_pos).includes("right")) offset = -Math.round(PREVIEW.width * 0.07);
+    }
+    q.style.display = "block";
+    q.style.top = atTop ? "56px" : "auto";
+    q.style.bottom = atTop ? "auto" : "56px";
+    q.style.width = Math.round(width) + "px";
+    q.style.transform = "translateX(calc(-50% + " + offset + "px))";
+    $("pv-qt").style.fontSize = Math.round(Style_h()*(S.verses_big?1.15:0.8)) + "px";
+    $("pv-qa").style.fontSize = Math.round(Style_h()*(S.verses_big?0.85:0.6)) + "px";
+  } else q.style.display="none";
+
+  $("pv-pw").style.fontSize = Math.round(Style_h()*1.125) + "px";
   applyLockText();
 }
 
+// A page on 127.0.0.1 cannot read file:// URLs, so the server hands the bytes
+// over instead: the preview of your picture works in the window and the browser.
+function localImage(path){
+  return "/api/file?path=" + encodeURIComponent(path) + "&v=" + (window.__imgRev || 0);
+}
 function withAlphaHex(hex, a){
   hex = hex.replace('#','');
   if (hex.length === 3) hex = hex.split('').map(c=>c+c).join('');
@@ -1841,10 +2623,29 @@ function applyLockText(){
   else { applyTheme(); }
 }
 
-function Style_h(){ return 26; } // base px for preview clock
+// The real lock screen's size and type scale, sent by the server. The preview
+// is laid out at that size and scaled to fit, so a px here is a px there.
+let PREVIEW = { width: 1920, height: 1080, heading: 16 };
+
+function Style_h(){ return PREVIEW.heading; }
+
+let ZOOM = "fit";   // "fit" scales the lock to the pane; "100" shows it 1:1
+
+function layoutScreen(){
+  const stage = $("stage"), wrap = $("screenWrap"), screen = $("screen");
+  stage.classList.toggle("zoomed", ZOOM === "100");
+  const k = ZOOM === "100" ? 1 : Math.max(0.05, Math.min(1,
+    (stage.clientWidth - 56) / PREVIEW.width,
+    (stage.clientHeight - 56) / PREVIEW.height));
+  screen.style.width = PREVIEW.width + "px";
+  screen.style.height = PREVIEW.height + "px";
+  screen.style.transform = "scale(" + k + ")";
+  wrap.style.width = Math.round(PREVIEW.width * k) + "px";
+  wrap.style.height = Math.round(PREVIEW.height * k) + "px";
+}
 
 function placeCorner(el, pos){
-  const m="48px";
+  const m="56px";
   el.style.top = pos.includes("top")?m:"auto";
   el.style.bottom = pos.includes("bottom")?m:"auto";
   el.style.left = pos.includes("left")?m:"auto";
@@ -1856,18 +2657,31 @@ function tick(){
   $("pv-time").textContent = fmtTime(d, S.clock_format, S.clock_tz, S.clock_show_seconds);
   $("pv-date").textContent = fmtDate(d, S.clock_date, S.clock_tz);
 }
-function tickQuote(){
-  if (!QUOTES.length) return;
-  const q = QUOTES[qIdx % QUOTES.length]; qIdx++;
+// The lock view picks the verse whose slot is the hour count since the epoch,
+// so the preview uses the same arithmetic and the two never disagree.
+function verseForNow(){
+  if (!VERSES.length) return null;
+  return VERSES[Math.floor(Date.now() / 3600000) % VERSES.length];
+}
+function tickVerse(){
+  const q = verseForNow();
+  if (!q) return;
   const sep = q.lastIndexOf(" — ");
   if (sep>=0){ $("pv-qt").textContent = q.slice(0,sep); $("pv-qa").textContent = q.slice(sep+3); }
   else { $("pv-qt").textContent = q; $("pv-qa").textContent=""; }
+}
+// Re-arm for the next hour boundary rather than polling.
+function verseClock(){
+  tickVerse();
+  setTimeout(verseClock, 3600000 - (Date.now() % 3600000) + 250);
 }
 async function tickMedia(){
   const m = await api("/api/media");
   const box = $("pv-media");
   if (S.media_enabled && m.title){ box.style.display="flex"; placeCorner(box, S.media_pos);
     $("pv-ti").textContent = m.title; $("pv-ar").textContent = m.artist||"";
+    $("pv-ti").style.fontSize = Math.round(Style_h()*0.75)+"px";
+    $("pv-ar").style.fontSize = Math.round(Style_h()*0.6)+"px";
     $("pv-art").style.backgroundImage = m.art?("url('"+m.art+"')"):"none";
   } else box.style.display="none";
 }
@@ -1904,6 +2718,7 @@ async function pickerLoad(path){
         if (r && r.upscaled) toast("Image upscaled for " + kind);
       } catch (err) { /* fall back to original path */ }
       $(pickerTarget).value = finalPath;
+      window.__imgRev = Date.now();   // new picture: don't reuse the old bytes
       collect(); renderPreview(); closePicker();
     };
     list.appendChild(el);
@@ -1941,10 +2756,20 @@ async function refreshRepoStatus(){
 
 async function refreshAuth(){
   const a = await api("/api/auth");
-  const face = a.face || {}, fp = a.fingerprint || {};
+  const face = a.face || {}, fp = a.fingerprint || {}, lock = a.lock || {};
 
   const setBadge = (id, cls, text) => { const b = $(id); if (!b) return; b.className = "badge " + cls; b.textContent = text; };
   const setDisabled = (id, on) => { const b = $(id); if (b) b.disabled = !!on; };
+
+  // Which plugin actually owns the lock — writes go there and nowhere else.
+  if (!lock.enabled) setBadge("lock-badge", "no", "no lock plugin");
+  else if (lock.conflicts && lock.conflicts.length) setBadge("lock-badge", "warn", "conflict");
+  else if (lock.view && lock.view.generated && lock.view.current) setBadge("lock-badge", "ok", "custom view active");
+  else if (lock.view && lock.view.generated) setBadge("lock-badge", "warn", "change pending");
+  else setBadge("lock-badge", "warn", "stock view");
+  $("lock-desc").textContent = (lock.enabled
+    ? "Customizing " + lock.id + (lock.face ? " (face unlock included)" : "") + " · " + lock.dir
+    : "—") + ((lock.warnings && lock.warnings.length) ? " · " + lock.warnings.join(" · ") : "");
 
   // Face
   if (!face.hardware) setBadge("face-badge", "no", "no camera");
@@ -1976,20 +2801,39 @@ async function authAction(component, action){
 }
 
 async function init(){
-  const [theme, settings, media] = await Promise.all([api("/api/theme"), api("/api/settings"), api("/api/media")]);
+  const [theme, settings, media, preview] = await Promise.all([
+    api("/api/theme"), api("/api/settings"), api("/api/media"), api("/api/preview")]);
+  if (preview && preview.width) PREVIEW = preview;
   THEME = theme; S = settings; applyTheme();
+  layoutScreen();
+  window.addEventListener("resize", layoutScreen);
+  $("zoom-fit").onclick = ()=>{ ZOOM = "fit"; $("zoom-fit").classList.add("on"); $("zoom-100").classList.remove("on"); layoutScreen(); };
+  $("zoom-100").onclick = ()=>{ ZOOM = "100"; $("zoom-100").classList.add("on"); $("zoom-fit").classList.remove("on"); layoutScreen(); };
   FIELDS.forEach(k=>setVal(k, S[k]));
   renderPreview(); bindLive(); tick(); setInterval(tick,1000);
   refreshRepoStatus();
   refreshAuth(); setInterval(refreshAuth, 15000);
-  setInterval(tickQuote, (S.quote_interval||12)*1000); tickQuote();
+  verseClock();
   tickMedia(); setInterval(tickMedia,2000);
 
   $("bg_browse").onclick = ()=>openPicker("bg_image");
   $("profile_avatar_browse").onclick = ()=>openPicker("profile_avatar");
   $("picker-cancel").onclick = closePicker;
   $("picker-up").onclick = ()=>pickerLoad(pickerCurParent);
-  $("apply").onclick = async ()=>{ collect(); const r=await api("/api/apply","POST",S); toast(r.ok?"Applied & restarted shell":("Error: "+(r.error||""))); };
+  $("apply").onclick = async ()=>{ collect(); const r=await api("/api/apply","POST",S);
+    if (!r.ok){
+      let why = r.error || "unknown";
+      if (r.rollback) why += " · " + r.rollback;
+      toast("Not applied: " + why);
+      refreshAuth(); return;
+    }
+    let msg = "Applied to " + (r.id || "lock");
+    if (r.verified === true) msg += ", verified after restart";
+    else if (r.restart_error) msg += " · takes effect at next shell start (" + r.restart_error + ")";
+    const carried = [].concat(r.added_properties||[], r.added_signals||[], r.added_functions||[]);
+    if (carried.length) msg += " · carried " + carried.join(", ");
+    if (r.conflicts && r.conflicts.length) msg += " · also enabled: " + r.conflicts.join(", ");
+    toast(msg); refreshAuth(); };
   $("save").onclick = async ()=>{ collect(); const r=await api("/api/settings","POST",S); toast(r.ok?"Saved":"Save failed"); };
   $("backup").onclick = async ()=>{ collect(); const r=await api("/api/apply","POST",S); toast(r.ok?"Backed up & applied":"Error"); };
   $("restore").onclick = restorePicker;
@@ -2037,14 +2881,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_local_file(self, path):
+        """Serve a picture for the preview (images only, capped size)."""
+        import mimetypes
+        path = urllib.parse.unquote(path or "")
+        if path.startswith("file://"):
+            path = path[7:]
+        path = os.path.expanduser(path)
+        ctype = mimetypes.guess_type(path)[0] or ""
+        if not path or not os.path.isfile(path) or not ctype.startswith("image/"):
+            self._send(404, {"error": "not an image"})
+            return
+        try:
+            if os.path.getsize(path) > 128 * 1024 * 1024:
+                self._send(413, {"error": "file too large"})
+                return
+            with open(path, "rb") as f:
+                data = f.read()
+        except Exception:
+            self._send(500, {"error": "unreadable"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         p = urllib.parse.urlparse(self.path).path
         if p == "/" or p == "/index.html":
-            self._send(200, HTML.replace("__QUOTES_JSON__", json.dumps(QUOTES)).replace(
+            self._send(200, HTML.replace("__VERSES_JSON__", json.dumps(VERSES, ensure_ascii=False)).replace(
                 "__FONT_OPTIONS__",
                 "".join('<option value="%s">' % f.replace('"', "") for f in installed_fonts())), "text/html")
         elif p == "/api/theme":
             self._send(200, active_theme_colors())
+        elif p == "/api/preview":
+            self._send(200, preview_info())
         elif p == "/api/settings":
             self._send(200, load_settings())
         elif p == "/api/media":
@@ -2058,6 +2931,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif p == "/api/files":
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             self._send(200, list_files(q.get("path", [""])[0]))
+        elif p == "/api/file":
+            # The preview shows your picture. A page served from 127.0.0.1 is
+            # not allowed to read file:// URLs, so the bytes come through here.
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            self._send_local_file(q.get("path", [""])[0])
         else:
             self._send(404, {"error": "not found"})
 
@@ -2079,37 +2957,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, sync_repo())
         elif p == "/api/apply":
             save_settings(data)
-            if not lockview:
-                self._send(500, {"ok": False, "error": "lock plugin not found"})
-                return
-            ensure_face_glyph(plugin)
-            backup_current(lockview, label="pre-apply")
-            try:
-                with open(lockview, "w") as f:
-                    f.write(render_lockview(data))
-            except Exception as e:
-                self._send(500, {"ok": False, "error": str(e)})
-                return
-            ok, err = restart_shell()
-            self._send(200, {"ok": ok, "error": err})
+            result = apply_view(data)
+            self._send(200 if result.get("ok") else 500, result)
         elif p == "/api/restore":
             if not lockview:
-                self._send(500, {"ok": False, "error": "lock plugin not found"})
+                self._send(500, {"ok": False, "error": "no enabled lock plugin"})
                 return
             ok, err = restore_backup(data.get("file", ""), lockview)
             self._send(200, {"ok": ok, "error": err})
         elif p == "/api/restore-stock":
-            if not lockview:
-                self._send(500, {"ok": False, "error": "lock plugin not found"})
+            target, _conflicts, _available = resolve_lock_target()
+            if not target:
+                self._send(500, {"ok": False, "error": "no enabled lock plugin"})
                 return
-            if not os.path.isfile(INITIAL_BACKUP):
-                self._send(500, {"ok": False, "error": "no stock backup"})
+            ok, msg = restore_stock_view(target)
+            if not ok:
+                self._send(500, {"ok": False, "error": msg})
                 return
-            import shutil
-            backup_current(lockview, label="pre-stock")
-            shutil.copy2(INITIAL_BACKUP, lockview)
-            ok, err = restart_shell()
-            self._send(200, {"ok": ok, "error": err})
+            started = time.time()
+            rok, rerr = restart_shell()
+            if rok:
+                wait_shell_ready()
+                errs = shell_errors_since(started, target)
+                if errs:
+                    self._send(200, {"ok": False, "error": errs[0][:200]})
+                    return
+            self._send(200, {"ok": rok, "error": "" if rok else rerr, "detail": msg})
         elif p == "/api/process-image":
             kind = data.get("kind", "background")
             if kind not in ("background", "avatar"):
@@ -2125,24 +2998,139 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+def sync_now(restart=False, quiet=False):
+    """Re-apply the saved settings to the active lock provider.
+
+    Called at startup and from the post-update hook, so an Omarchy or omaFace
+    update that rebuilds the plugin hands the customized view back instead of
+    leaving the stock one in place (or a view the new Service.qml cannot load).
+    Validation, restart verification and rollback all live in apply_view().
+    """
+    settings = load_settings()
+    result = apply_view(settings, restart=restart, verify=restart)
+    if not quiet:
+        if not result.get("ok"):
+            print("Not applied: " + (result.get("error") or "unknown"))
+        else:
+            print(("Updated %s (%s)" % (result["id"], result["dir"]))
+                  if result.get("changed") else ("%s already current" % result["id"]))
+            carried = (result.get("added_properties", []) + result.get("added_signals", [])
+                       + result.get("added_functions", []))
+            if carried:
+                print("Carried new host contract: " + ", ".join(carried))
+            if result.get("verified") is True:
+                print("Verified after restart.")
+            elif result.get("verified") is False and result.get("load_errors"):
+                print("Rolled back: " + (result.get("rollback") or ""))
+            if result.get("restart_error"):
+                print("Shell restart: " + result["restart_error"])
+    return result
+
+
+def studio_running(url, timeout=0.7):
+    """True when another lock-studio server already answers on this port."""
+    try:
+        with urllib.request.urlopen(url + "api/settings", timeout=timeout) as r:
+            return r.status == 200 and b"verses_enabled" in r.read()
+    except Exception:
+        return False
+
+
+def run_app_window(url):
+    """Show the studio in its own window; False when GTK/WebKit are unusable.
+
+    A real window (not a browser tab) means it lives in the launcher and the
+    dock with its own icon, and closing it stops the server behind it.
+    """
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("WebKit2", "4.1")
+        from gi.repository import Gdk, GLib, Gtk, WebKit2
+    except Exception as exc:
+        print("No app window (%s) — falling back to the browser." % exc)
+        return False
+    if Gdk.Display.get_default() is None:
+        print("No display — starting the server only.")
+        return False
+
+    # Names the window after the .desktop file so the shell can match the icon
+    # and any window rule to it.
+    GLib.set_prgname("omarchy-lock-studio")
+    GLib.set_application_name("Omarchy Lock Studio")
+
+    win = Gtk.Window(title="Omarchy Lock Studio")
+    win.set_default_size(1340, 940)
+    # The UI is a settings column beside a live preview; below this it folds
+    # into a stamp. The hint also stops a tiled window opening too narrow.
+    geo = Gdk.Geometry()
+    geo.min_width, geo.min_height = 900, 620
+    win.set_geometry_hints(None, geo, Gdk.WindowHints.MIN_SIZE)
+    win.set_size_request(900, 620)
+    win.set_icon_name("omarchy-lock-studio")
+    view = WebKit2.WebView()
+    view.load_uri(url)
+    win.add(view)
+
+    def on_key(_w, ev):
+        ctrl = bool(ev.state & Gdk.ModifierType.CONTROL_MASK)
+        if ev.keyval == Gdk.KEY_F5 or (ctrl and ev.keyval in (Gdk.KEY_r, Gdk.KEY_R)):
+            view.reload()
+            return True
+        if ctrl and ev.keyval in (Gdk.KEY_q, Gdk.KEY_w):
+            win.destroy()
+            return True
+        return False
+
+    win.connect("key-press-event", on_key)
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    Gtk.main()
+    return True
+
+
+def show_studio(url, mode):
+    """Open the UI the requested way: own window, else a browser tab."""
+    if mode in ("app", "auto") and run_app_window(url):
+        return "app"
+    for opener in (["firefox", url], ["xdg-open", url]):
+        try:
+            subprocess.Popen(opener)
+            return "browser"
+        except Exception:
+            continue
+    print("Could not open a window; open " + url + " manually.")
+    return None
+
+
 def main():
     os.makedirs(BACKUP_DIR, exist_ok=True)
     plugin = find_plugin_dir()
     lockview = os.path.join(plugin, "LockView.qml") if plugin else None
-    ensure_initial_backup(lockview)
+    if plugin:
+        ensure_initial_backup(lockview, label=os.path.basename(plugin))
     ensure_face_glyph(plugin)
-    if len(sys.argv) > 1 and sys.argv[1] == "--restore-stock":
-        if lockview and os.path.isfile(INITIAL_BACKUP):
-            import shutil
-            backup_current(lockview, label="pre-stock")
-            shutil.copy2(INITIAL_BACKUP, lockview)
-            ok, err = restart_shell()
-            print(("Restored stock. " + err) if ok else ("Failed: " + err))
+
+    args = sys.argv[1:]
+    if "--restore-stock" in args:
+        target, _conflicts, _available = resolve_lock_target()
+        if not target:
+            print("Cannot restore stock: no enabled lock plugin.")
+            return
+        ok, msg = restore_stock_view(target)
+        if ok:
+            rok, err = restart_shell()
+            print("Restored stock." if rok else ("Restored, but the shell restart failed: " + err))
         else:
-            print("Cannot restore stock: plugin/backup not found.")
+            print("Cannot restore stock: " + msg)
         return
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--sync-repo":
+    if "--sync" in args:
+        r = sync_now(restart="--restart" in args, quiet="--quiet" in args)
+        sys.exit(0 if r.get("ok") else 2)
+
+    if "--sync-repo" in args:
         r = sync_repo()
         if r.get("ok"):
             print(("Synced: " + r["commit"]) if r.get("committed") else "Project repo already up to date.")
@@ -2150,8 +3138,22 @@ def main():
             print("Sync failed: " + r.get("error", "unknown"))
         return
 
+    # A relaunch after an update repairs the view before the browser opens, so
+    # the preview never lies about what the lock will show.
+    if plugin:
+        sync_now(quiet=True)
+
     no_open = "--no-open" in sys.argv
+    mode = "browser" if "--browser" in sys.argv else ("app" if "--app" in sys.argv else "auto")
     url = f"http://127.0.0.1:{PORT}/"
+
+    # Already running (a second click on the launcher): open a window onto the
+    # live server instead of killing it out from under the first one.
+    if not no_open and studio_running(url):
+        print("Omarchy Lock Studio is already running.")
+        show_studio(url, mode)
+        return
+
     server = None
     for attempt in range(6):
         try:
@@ -2163,31 +3165,22 @@ def main():
             free_port(PORT)
             time.sleep(0.5)
     if server is None:
-        print(f"Could not bind {PORT}. Opening browser to any existing instance.")
+        print(f"Could not bind {PORT}. Opening the running instance's UI.")
         if not no_open:
-            try:
-                subprocess.Popen(["firefox", url])
-            except Exception:
-                try:
-                    subprocess.Popen(["xdg-open", url])
-                except Exception:
-                    pass
+            show_studio(url, mode)
         return
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     print(f"Omarchy Lock Studio running at {url}")
-    print("Press Ctrl+C to stop.")
     if not no_open:
-        try:
-            subprocess.Popen(["firefox", url])
-        except Exception:
-            try:
-                subprocess.Popen(["xdg-open", url])
-            except Exception:
-                print("Could not auto-open firefox; open the URL manually.")
+        if show_studio(url, mode) == "app":
+            # The window is the app: closing it stops the server with it.
+            sys.stdout.flush()
+            os._exit(0)
+        print("Press Ctrl+C to stop.")
     try:
         while True:
-            server.serve_forever()
+            time.sleep(3600)
     except KeyboardInterrupt:
         print("\nStopping.")
         server.shutdown()
